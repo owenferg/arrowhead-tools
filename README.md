@@ -1,0 +1,1 @@
+A tool I am designing for CMS's Global Atlas of Ungulate Migration interactive webmap that automatically rotates an arrow's arrowhead to match the relevant line attached to it.
