@@ -61,6 +61,7 @@ def run() -> None:
             status for (status,) in arcpy.da.SearchCursor(audit, ["STATUS"])
         )
         assert statuses == ["MATCHED", "MATCHED", "UNMATCHED"], statuses
+        arcpy.management.ClearWorkspaceCache()
         print("ArcGIS Pro smoke test passed")
 
 
