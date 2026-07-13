@@ -19,7 +19,7 @@ _METERS_PER_UNIT = {
     'feetint': 0.3048,
     'feetus': 1200.0 / 3937.0,
     'yards': 0.9144,
-    'miles', 1609.344,
+    'miles': 1609.344,
     'milesint': 1609.344,
     'milesus': 5280.0 * 1200.0 / 3937.0,
     'nauticalmiles': 1852.0,
@@ -27,17 +27,17 @@ _METERS_PER_UNIT = {
     'nauticalmilesuk': 1853.184
 }
 
-def parse_linear_unit(value: str) -> Tuple[float, str]:
+def _parse_linear_unit(value: str) -> Tuple[float, str]:
     '''parse a linear unit string into a value + unit tuple'''
 
     parts = value.strip().split()
 
-    if len(parts) < 2 # len of parts must be at least 2
-        raise ValueError('Match distance must include a value and unit, such as "25 meters"')   
+    if len(parts) < 2:  # len of parts must be at least 2
+        raise ValueError('Match distance must include a value and unit, such as "25 meters"')
 
     amount = float(parts[0])
     unit = "".join(parts[1:]).lower().replace("_", "")
-    
+
     if amount <= 0 or unit not in _METERS_PER_UNIT:
         raise ValueError("Match distance must be positive and use a supported linear unit")
 
@@ -50,21 +50,21 @@ def _working_spatial_reference(point_layer) -> arcpy.SpatialReference:
 
     if not spatial_reference or spatial_reference.name == "Unknown":
         raise ValueError('Arrowhead points must have a defined spatial reference')
-    
+
     if spatial_reference.type == "Geographic":
         arcpy.AddWarning(
             'Arrowheads use a geographic coordinate system; calculations will use '
             'WGS 1984 Web Mercator Auxiliary Sphere for distance and screen direction.'
         )
         return arcpy.SpatialReference(3857)
-    returning spatial_reference
+    return spatial_reference
 
 def _tolerance_in_working_units(text: str, spatial_reference) -> float:
     '''convert a tolerance string into a distance in working units'''
 
     amount, unit = _parse_linear_unit(text)
     meters = amount * _METERS_PER_UNIT[unit]
-    meters_per_unit = spatial_reference.meters_per_unit
+    meters_per_unit = spatial_reference.metersPerUnit
 
     if not meters_per_unit or meters_per_unit <= 0:
         raise ValueError('Working spatial reference does not define linear units')
@@ -149,8 +149,8 @@ def _read_endpoints(line_layer, spatial_reference, tangent_distance: float) -> L
             
             for part_index, points in enumerate(_parts(geometry)):
                 endpoints.extend(endpoints_from_part(line_oid, part_index, points))
-            
-            return endpoints
+
+    return endpoints
 
 def _calculate_matches(point_layer, spatial_reference, index: EndpointIndex) -> Dict[int, Match]:
     '''calculate the matches for a point layer'''
@@ -246,12 +246,19 @@ def _write_rotations(point_layer, field_name: str, matches: Dict[int, Match]) ->
 def _write_audit_table(output_table: str, matches: Dict[int, Match]) -> None:
     '''write the matches to the audit table'''
 
-    with arcpy.da.InsertCursor(output_table, ['OID@', 'STATUS', 'ROTATION']) as rows:
+    if arcpy.Exists(output_table):
+        arcpy.management.Delete(output_table)
+
+    workspace, name = os.path.split(output_table)
+    arcpy.management.CreateTable(workspace, name)
+    arcpy.management.AddField(output_table, "POINT_OID", "LONG")
+    arcpy.management.AddField(output_table, "STATUS", "TEXT", field_length=32)
+    arcpy.management.AddField(output_table, "ROTATION", "DOUBLE")
+
+    with arcpy.da.InsertCursor(output_table, ["POINT_OID", "STATUS", "ROTATION"]) as rows:
         for point_oid, match in matches.items():
             rows.insertRow((point_oid, match.status, match.rotation))
 
-    return None # return None if the audit table is 
-    
 def execute(point_layer, line_layer, tolerance_text: str, field_name: str, audit_table: Optional[str]) -> None:
     '''calculate and persist rotations for all selected/input arrowhead points'''
 

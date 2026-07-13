@@ -3,13 +3,13 @@ pure python geometry and matching logic for arrowheads
 
 I intentionally didnt include any arcpy dependency so
 the direction math and spatial matching can be tested in any Python runtime.
-Angles use the GIUM convention: east = 0, positive values rotate clockwise
+Angles use clockwise-from-east: east = 0, positive values rotate clockwise.
 """
 
 from __future__ import annotations
-from dataclasses import dataclasses
+from dataclasses import dataclass
 import math
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 PointXY = Tuple[float, float]
 
@@ -17,7 +17,7 @@ PointXY = Tuple[float, float]
 class Endpoint:
     '''usable line endpoint and the terminal vector pointing toward it'''
 
-    line_old: int
+    line_oid: int
     part_index: int
     endpoint: str
     x: float
@@ -94,7 +94,7 @@ class EndpointIndex:
         self.endpoint_count = 0
 
         for ep in endpoints:
-            self._cells.setdefault(self._cell(endpoint.x, endpoint.y), []).append(ep)
+            self._cells.setdefault(self._cell(ep.x, ep.y), []).append(ep)
             self.endpoint_count += 1
 
     def _cell(self, x: float, y: float) -> Tuple[int, int]:
@@ -107,7 +107,7 @@ class EndpointIndex:
 
         cell_x, cell_y = self._cell(x,y)
         tolerance_sq = self.search_tolerance * self.search_tolerance
-        candidates = List[Tuple[float, Endpoint]] = []
+        candidates: List[Tuple[float, Endpoint]] = []
 
         for offset_x in (-1, 0, 1):
             for offset_y in (-1, 0, 1):

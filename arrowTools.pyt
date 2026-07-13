@@ -1,6 +1,5 @@
 """
 Portable ArcGIS Pro Python toolbox to help automate rotating arrowheads.
-Intended for the GIUM fact sheet data pipeline
 Created by Owen Ferguson
 """
 
@@ -53,8 +52,8 @@ class RotateArrowheads:
 
     def execute(self, parameters, messages):
         try:
-            migration_arrow_tool.execute(
-                parameters[0].valueAsText, # arrowhead points  
+            arrow_tool.execute(
+                parameters[0].valueAsText, # arrowhead points
                 parameters[1].valueAsText, # lines
                 parameters[2].valueAsText, # maximum endpoint match distance
                 parameters[3].valueAsText, # rotation field name
