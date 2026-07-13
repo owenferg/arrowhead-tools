@@ -33,7 +33,7 @@ def _parse_linear_unit(value: str) -> Tuple[float, str]:
     parts = value.strip().split()
 
     if len(parts) < 2:  # len of parts must be at least 2
-        raise ValueError('Match distance must include a value and unit, such as "25 meters"')
+        raise ValueError('Match distance must include a value and unit, such as "10 meters"')
 
     amount = float(parts[0])
     unit = "".join(parts[1:]).lower().replace("_", "")
