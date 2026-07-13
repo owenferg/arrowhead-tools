@@ -23,20 +23,56 @@ class RotateArrowheads:
 
     def getParameterInfo(self):
         """Parameters for the arrowhead rotation tool"""
-        points = arcpy.Parameter("Arrowhead points", "arrowhead_points", "GPFeatureLayer", "Required", "Input")
+        points = arcpy.Parameter(
+            displayName="Arrowhead points",
+            name="arrowhead_points",
+            datatype="GPFeatureLayer",
+            parameterType="Required",
+            direction="Input",
+        )
         points.filter.list = ["Point"]
 
-        lines = arcpy.Parameter("Lines", "lines", "GPFeatureLayer", "Required", "Input")
+        lines = arcpy.Parameter(
+            displayName="Lines",
+            name="lines",
+            datatype="GPFeatureLayer",
+            parameterType="Required",
+            direction="Input",
+        )
         lines.filter.list = ["Polyline"]
 
-        tolerance = arcpy.Parameter("Maximum endpoint match distance", "match_distance", "GPLinearUnit", "Required", "Input")
+        tolerance = arcpy.Parameter(
+            displayName="Maximum endpoint match distance",
+            name="match_distance",
+            datatype="GPLinearUnit",
+            parameterType="Required",
+            direction="Input",
+        )
         tolerance.value = "25 Meters"
 
-        field_name = arcpy.Parameter("Rotation field name", "rotation_field", "GPString", "Required", "Input")
+        field_name = arcpy.Parameter(
+            displayName="Rotation field name",
+            name="rotation_field",
+            datatype="GPString",
+            parameterType="Required",
+            direction="Input",
+        )
         field_name.value = "rotation_deg"
 
-        audit = arcpy.Parameter("Audit output table", "audit_table", "DETable", "Optional", "Output")
-        derived = arcpy.Parameter("Updated arrowhead layer", "updated_arrowheads", "GPFeatureLayer", "Derived", "Output")
+        audit = arcpy.Parameter(
+            displayName="Audit output table",
+            name="audit_table",
+            datatype="DETable",
+            parameterType="Optional",
+            direction="Output",
+        )
+        derived = arcpy.Parameter(
+            displayName="Updated arrowhead layer",
+            name="updated_arrowheads",
+            datatype="GPFeatureLayer",
+            parameterType="Derived",
+            direction="Output",
+        )
         derived.parameterDependencies = [points.name]
         derived.schema.clone = True
 
