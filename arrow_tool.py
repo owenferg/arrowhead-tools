@@ -3,10 +3,17 @@ ArcPy adapter for the arrowhead rotation tool
 """
 
 from __future__ import annotations
+import math
 import os
 from typing import Dict, Iterator, List, Optional, Tuple
 import arcpy
-from arrow_rotation_core import Endpoint, EndpointIndex, Match, endpoints_from_part
+from arrow_rotation_core import (
+    Endpoint,
+    EndpointIndex,
+    Match,
+    clockwise_angle_from_east,
+    endpoints_from_part,
+)
 
 _METERS_PER_UNIT = {
     "millimeters": 0.001,
@@ -130,7 +137,8 @@ def _parts(geometry) -> Iterator[List[Tuple[float, float]]]:
 def _read_endpoints(line_layer, spatial_reference, lookback_distance: float) -> List[Endpoint]:
     '''read the endpoints from a line layer'''
 
-    endpoints: List[Endpoint] = [] 
+    endpoints: List[Endpoint] = []
+    changed_directions = 0
     # get the transformation for the line layer
     transformation = _projection_for_layer(line_layer, spatial_reference)
 
@@ -149,9 +157,28 @@ def _read_endpoints(line_layer, spatial_reference, lookback_distance: float) -> 
             
             for part_index, points in enumerate(_parts(geometry)):
                 # add the endpoints using the arrowhead lookback distance
-                endpoints.extend(
-                    endpoints_from_part(line_oid, part_index, points, lookback_distance)
+                lookback_endpoints = endpoints_from_part(
+                    line_oid, part_index, points, lookback_distance
                 )
+                terminal_endpoints = endpoints_from_part(line_oid, part_index, points)
+                endpoints.extend(lookback_endpoints)
+
+                # compare the lookback directions to the absolute endpoint directions
+                for lookback, terminal in zip(lookback_endpoints, terminal_endpoints):
+                    lookback_angle = clockwise_angle_from_east(lookback.dx, lookback.dy)
+                    terminal_angle = clockwise_angle_from_east(terminal.dx, terminal.dy)
+                    if not math.isclose(lookback_angle, terminal_angle, abs_tol=1e-9):
+                        changed_directions += 1
+
+    arcpy.AddMessage(
+        f'Lookback changed direction at {changed_directions:,} of '
+        f'{len(endpoints):,} line endpoints'
+    )
+    if endpoints and changed_directions == 0:
+        arcpy.AddWarning(
+            'The lookback did not reach a different line direction at any endpoint; '
+            'increase the distance or use lines with more detailed terminal geometry'
+        )
 
     return endpoints
 

@@ -232,6 +232,9 @@ class ArrowToolTests(unittest.TestCase):
             "points", "lines", "2 Meters", "rotation_deg", None, "25 Meters"
         )
         self.assertEqual(self.point_rows[0]["rotation_deg"], 270)
+        self.assertTrue(
+            any("changed direction at 2 of 2" in message for message in self.arcpy.messages)
+        )
 
     def test_non_numeric_rotation_field_is_rejected_before_update(self):
         self.arcpy.datasets["points"].fields[-1].type = "String"
