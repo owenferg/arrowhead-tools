@@ -231,7 +231,7 @@ class ArrowToolTests(unittest.TestCase):
         self.tool.execute(
             "points", "lines", "2 Meters", "rotation_deg", None, "25 Meters"
         )
-        self.assertEqual(self.point_rows[0]["rotation_deg"], 90)
+        self.assertEqual(self.point_rows[0]["rotation_deg"], 270)
         self.assertTrue(
             any("changed direction at 2 of 2" in message for message in self.arcpy.messages)
         )

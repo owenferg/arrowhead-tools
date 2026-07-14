@@ -67,15 +67,13 @@ def endpoints_from_part(
     if len(points)<2 or points[0] == points[-1]:
         return []
 
-    def terminal_vector(
-        ordered_points: Iterable[PointXY], distance: Optional[float]
-    ) -> Optional[PointXY]:
+    def terminal_vector(ordered_points: Iterable[PointXY]) -> Optional[PointXY]:
         '''get the line direction toward the endpoint at the lookback distance'''
 
         # set the first point as the endpoint and start walking along the line
         iterator = iter(ordered_points)
         endpoint = previous = next(iterator)
-        remaining = distance
+        remaining = lookback_distance
 
         # iter over each line segment until the lookback distance is reached
         for point in iterator:
@@ -98,33 +96,10 @@ def endpoints_from_part(
         # if the line is shorter than the lookback distance, use the whole line
         return None if previous == endpoint else (endpoint[0] - previous[0], endpoint[1] - previous[1])
 
-    def inverse_lookback_vector(
-        terminal: Optional[PointXY], lookback: Optional[PointXY]
-    ) -> Optional[PointXY]:
-        '''reflect the lookback rotation around the absolute endpoint rotation'''
-
-        if terminal is None or lookback is None:
-            return None
-        if lookback_distance is None:
-            return terminal
-
-        # get the absolute endpoint angle and the angle at the lookback distance
-        terminal_angle = clockwise_angle_from_east(terminal[0], terminal[1])
-        lookback_angle = clockwise_angle_from_east(lookback[0], lookback[1])
-        # reflect the lookback adjustment to the opposite side of the endpoint angle
-        inverse_angle = (2 * terminal_angle - lookback_angle) % 360.0
-        radians = math.radians(inverse_angle)
-        return math.cos(radians), -math.sin(radians)
-
     start = points[0] # first point
     end = points[-1] # last point
-    start_vector = inverse_lookback_vector(
-        terminal_vector(points, None), terminal_vector(points, lookback_distance)
-    ) # inversely adjusted vector pointing toward the start
-    end_vector = inverse_lookback_vector(
-        terminal_vector(reversed(points), None),
-        terminal_vector(reversed(points), lookback_distance),
-    ) # inversely adjusted vector pointing toward the end
+    start_vector = terminal_vector(points) # vector pointing toward the start
+    end_vector = terminal_vector(reversed(points)) # vector pointing toward the end
 
     records: List[Endpoint] = []
     if start_vector is not None: # if there is a start vector, add a start record
