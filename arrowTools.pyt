@@ -5,9 +5,11 @@ Created by Owen Ferguson
 
 import importlib
 import arcpy
+import arrow_rotation_core
 import arrow_tool
 
-# reload the script when the toolbox is refreshed so ArcGIS does not use an older cached version
+# reload the scripts when the toolbox is refreshed so ArcGIS does not use older cached versions
+arrow_rotation_core = importlib.reload(arrow_rotation_core)
 arrow_tool = importlib.reload(arrow_tool)
 
 class Toolbox:
