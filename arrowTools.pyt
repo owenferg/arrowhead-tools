@@ -3,8 +3,12 @@ Portable ArcGIS Pro Python toolbox to help automate rotating arrowheads.
 Created by Owen Ferguson
 """
 
+import importlib
 import arcpy
 import arrow_tool
+
+# reload the script when the toolbox is refreshed so ArcGIS does not use an older cached version
+arrow_tool = importlib.reload(arrow_tool)
 
 class Toolbox:
     def __init__(self):
