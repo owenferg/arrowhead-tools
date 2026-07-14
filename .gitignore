@@ -16,3 +16,6 @@ htmlcov/
 .DS_Store
 .idea/
 .vscode/
+
+# packaged toolbox releases
+releases/

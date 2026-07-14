@@ -4,7 +4,7 @@ import sys
 import unittest
 
 
-PACKAGE = pathlib.Path(__file__).resolve().parents[1]
+PACKAGE = pathlib.Path(__file__).resolve().parents[1] / "toolbox"
 sys.path.insert(0, str(PACKAGE))
 
 from arrow_rotation_core import (  # noqa: E402
@@ -43,22 +43,6 @@ class EndpointTests(unittest.TestCase):
         endpoints = endpoints_from_part(7, 0, [(0, 0), (0, 0), (2, 0), (2, 0)])
         self.assertEqual((endpoints[0].dx, endpoints[0].dy), (-2, 0))
         self.assertEqual((endpoints[1].dx, endpoints[1].dy), (2, 0))
-
-    def test_lookback_vectors_follow_the_arrowhead_footprint(self):
-        endpoints = endpoints_from_part(
-            7, 0, [(0, 0), (0, 4), (2, 4), (4, 4)], 5
-        )
-        self.assertEqual((endpoints[0].dx, endpoints[0].dy), (-2, 0))
-        self.assertEqual((endpoints[1].dx, endpoints[1].dy), (0, 4))
-
-    def test_lookback_longer_than_line_uses_the_whole_line(self):
-        endpoints = endpoints_from_part(7, 0, [(0, 0), (3, 4)], 10)
-        self.assertEqual((endpoints[0].dx, endpoints[0].dy), (-3, -4))
-        self.assertEqual((endpoints[1].dx, endpoints[1].dy), (3, 4))
-
-    def test_invalid_lookback_is_rejected(self):
-        with self.assertRaises(ValueError):
-            endpoints_from_part(7, 0, [(0, 0), (1, 0)], 0)
 
     def test_degenerate_and_closed_parts_have_no_endpoints(self):
         self.assertEqual(endpoints_from_part(1, 0, [(0, 0)]), [])

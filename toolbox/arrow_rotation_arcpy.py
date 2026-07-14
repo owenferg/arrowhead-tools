@@ -45,7 +45,7 @@ def _parse_linear_unit(value: str) -> Tuple[float, str]:
     amount = float(parts[0])
     unit = "".join(parts[1:]).lower().replace("_", "")
 
-    if amount <= 0 or unit not in _METERS_PER_UNIT:
+    if not math.isfinite(amount) or amount <= 0 or unit not in _METERS_PER_UNIT:
         raise ValueError("Match distance must be positive and use a supported linear unit")
 
     return amount, unit
@@ -134,8 +134,6 @@ def _parts(geometry) -> Iterator[List[Tuple[float, float]]]:
         if points:
             yield points
 
-# rotation lookback is disabled while the rotation buffer is in use
-# def _read_endpoints(line_layer, spatial_reference, tangent_distance: float, lookback_distance: float) -> List[Endpoint]:
 def _read_endpoints(line_layer, spatial_reference, tangent_distance: float) -> List[Endpoint]:
     '''read the endpoints from a line layer'''
 
@@ -157,10 +155,6 @@ def _read_endpoints(line_layer, spatial_reference, tangent_distance: float) -> L
                 geometry = geometry.densify('DISTANCE', tangent_distance, 0.0)
             
             for part_index, points in enumerate(_parts(geometry)):
-                # use this call instead to restore the optional lookback direction
-                # lookback_endpoints = endpoints_from_part(
-                #     line_oid, part_index, points, lookback_distance
-                # )
                 endpoints.extend(endpoints_from_part(line_oid, part_index, points))
 
     return endpoints
@@ -285,7 +279,6 @@ def execute(
     tolerance_text: str,
     field_name: str,
     audit_table: Optional[str],
-    # lookback_text: str = "25 Meters",
     rotation_buffer_text: str = "3",
 ) -> None:
     '''calculate and persist rotations for all selected/input arrowhead points'''
@@ -304,8 +297,6 @@ def execute(
         raise ValueError('Rotation buffer must be a number') from None
     if not math.isfinite(rotation_buffer):
         raise ValueError('Rotation buffer must be a finite number')
-    # rotation lookback is disabled while the rotation buffer is in use
-    # lookback_distance = _tolerance_in_working_units(lookback_text, spatial_reference)
     # get the one meter value for the spatial reference
     one_meter = 1.0 / spatial_reference.metersPerUnit
     # get the tangent distance for curved line endpoints

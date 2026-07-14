@@ -19,7 +19,7 @@ import arcpy
 PACKAGE = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PACKAGE))
 
-import arrow_tool  # noqa: E402
+import arrow_rotation_arcpy  # noqa: E402
 
 def run() -> None:
     spatial_reference = arcpy.SpatialReference(3857)
@@ -48,7 +48,7 @@ def run() -> None:
         with arcpy.da.InsertCursor(lines, ["SHAPE@"]) as rows:
             rows.insertRow((line,))
 
-        arrow_tool.execute(
+        arrow_rotation_arcpy.execute(
             points, lines, "2 Meters", "rotation_deg", audit
         )
         rotations = [

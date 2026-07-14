@@ -10,7 +10,7 @@ import types
 import unittest
 
 
-PACKAGE = pathlib.Path(__file__).resolve().parents[1]
+PACKAGE = pathlib.Path(__file__).resolve().parents[1] / "toolbox"
 sys.path.insert(0, str(PACKAGE))
 
 
@@ -39,10 +39,10 @@ class ToolboxContractTests(unittest.TestCase):
         arcpy.Parameter = Parameter
         arcpy.AddError = lambda message: None
         sys.modules["arcpy"] = arcpy
-        sys.modules.pop("arrow_tool", None)
+        sys.modules.pop("arrow_rotation_arcpy", None)
 
         loader = importlib.machinery.SourceFileLoader(
-            "arrow_tools_contract", str(PACKAGE / "arrowTools.pyt")
+            "arrow_tools_contract", str(PACKAGE / "arrow_tools.pyt")
         )
         spec = importlib.util.spec_from_loader(loader.name, loader)
         self.toolbox = importlib.util.module_from_spec(spec)
@@ -68,7 +68,7 @@ class ToolboxContractTests(unittest.TestCase):
             parameter.value = value
 
         forwarded = []
-        self.toolbox.arrow_tool.execute = lambda *args: forwarded.append(args)
+        self.toolbox.arrow_rotation_arcpy.execute = lambda *args: forwarded.append(args)
         self.toolbox.RotateArrowheads().execute(parameters, None)
 
         self.assertEqual(

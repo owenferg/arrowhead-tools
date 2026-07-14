@@ -6,7 +6,7 @@ An ArcGIS Pro Python toolbox that rotates arrowhead point features to match near
 
 [Download the latest ArcGIS Pro toolbox](https://github.com/owenferg/arrowhead-tools/releases/latest/)
 
-Extract the ZIP, then add `arrowTools.pyt` to the ArcGIS Pro Catalog pane.
+Extract the ZIP, then add `arrow_tools.pyt` to the ArcGIS Pro Catalog pane.
 Keep all three extracted files in the same folder.
 
 ## Requirements
@@ -21,11 +21,11 @@ No third-party Python packages are required.
 
 Keep the three files in `toolbox/` together:
 
-- `arrowTools.pyt`
-- `arrow_tool.py`
+- `arrow_tools.pyt`
+- `arrow_rotation_arcpy.py`
 - `arrow_rotation_core.py`
 
-In ArcGIS Pro, add `arrowTools.pyt` to the Catalog pane and open **Calculate Arrowhead Rotations**.
+In ArcGIS Pro, add `arrow_tools.pyt` to the Catalog pane and open **Calculate Arrowhead Rotations**.
 
 ## Use
 

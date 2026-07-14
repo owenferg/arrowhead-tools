@@ -6,11 +6,11 @@ created by Owen Ferguson
 import importlib
 import arcpy
 import arrow_rotation_core
-import arrow_tool
+import arrow_rotation_arcpy
 
 # reload the scripts when the toolbox is refreshed so ArcGIS does not use older cached versions
 arrow_rotation_core = importlib.reload(arrow_rotation_core)
-arrow_tool = importlib.reload(arrow_tool)
+arrow_rotation_arcpy = importlib.reload(arrow_rotation_arcpy)
 
 class Toolbox:
     def __init__(self):
@@ -55,7 +55,7 @@ class RotateArrowheads:
             parameterType="Required",
             direction="Input",
         )
-        tolerance.value = "25 Meters"
+        tolerance.value = "5 Meters"
 
         field_name = arcpy.Parameter(
             displayName="Rotation field name",
@@ -66,16 +66,6 @@ class RotateArrowheads:
         )
         field_name.parameterDependencies = [points.name]
         field_name.value = "Rotation"
-
-        # rotation lookback is disabled while the rotation buffer is in use
-        # lookback = arcpy.Parameter(
-        #     displayName="Arrowhead rotation lookback distance",
-        #     name="rotation_lookback",
-        #     datatype="GPLinearUnit",
-        #     parameterType="Required",
-        #     direction="Input",
-        # )
-        # lookback.value = "25 Meters"
 
         rotation_buffer = arcpy.Parameter(
             displayName="Clockwise rotation buffer (degrees)",
@@ -115,7 +105,7 @@ class RotateArrowheads:
 
     def execute(self, parameters, messages):
         try:
-            arrow_tool.execute(
+            arrow_rotation_arcpy.execute(
                 parameters[0].valueAsText, # arrowhead points
                 parameters[1].valueAsText, # lines
                 parameters[2].valueAsText, # maximum endpoint match distance

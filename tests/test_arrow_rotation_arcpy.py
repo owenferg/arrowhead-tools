@@ -1,5 +1,5 @@
 '''
-unit tests for arrow_tool.py without requiring an ArcGIS Pro license
+unit tests for arrow_rotation_arcpy.py without requiring an ArcGIS Pro license
 '''
 
 import importlib
@@ -9,7 +9,7 @@ import types
 import unittest
 
 
-PACKAGE = pathlib.Path(__file__).resolve().parents[1]
+PACKAGE = pathlib.Path(__file__).resolve().parents[1] / "toolbox"
 sys.path.insert(0, str(PACKAGE))
 
 
@@ -179,8 +179,8 @@ class ArrowToolTests(unittest.TestCase):
     def setUp(self):
         self.arcpy = build_fake_arcpy()
         sys.modules["arcpy"] = self.arcpy
-        sys.modules.pop("arrow_tool", None)
-        self.tool = importlib.import_module("arrow_tool")
+        sys.modules.pop("arrow_rotation_arcpy", None)
+        self.tool = importlib.import_module("arrow_rotation_arcpy")
 
         sr = SpatialReference(32633, "UTM 33N")
         self.point_rows = [
@@ -271,6 +271,11 @@ class ArrowToolTests(unittest.TestCase):
         value, unit = self.tool._parse_linear_unit("10 Feet US")
         self.assertEqual((value, unit), (10, "feetus"))
         self.assertAlmostEqual(self.tool._METERS_PER_UNIT[unit], 1200.0 / 3937.0)
+
+    def test_non_finite_match_distance_is_rejected(self):
+        for value in ("nan Meters", "inf Meters"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "positive"):
+                self.tool._parse_linear_unit(value)
 
 
 if __name__ == "__main__":

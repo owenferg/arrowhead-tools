@@ -3,7 +3,6 @@ pure python geometry and matching logic for arrowheads
 
 I intentionally didnt include any arcpy dependency so
 the direction math and spatial matching can be tested in any Python runtime.
-Angles use clockwise-from-east: east = 0, positive values rotate clockwise.
 '''
 
 from __future__ import annotations
@@ -53,48 +52,23 @@ def endpoints_from_part(
     line_oid: int,
     part_index: int,
     points: Sequence[PointXY],
-    lookback_distance: Optional[float] = None,
 ) -> List[Endpoint]:
     '''create start/end records using the terminal line direction'''
-
-    # if a lookback distance is provided, make sure it is usable
-    if lookback_distance is not None and (
-        not math.isfinite(lookback_distance) or lookback_distance <= 0
-    ):
-        raise ValueError('Lookback distance must be a positive finite number')
 
     # if the part has fewer than two points or is closed, there are no usable endpoints
     if len(points)<2 or points[0] == points[-1]:
         return []
 
     def terminal_vector(ordered_points: Iterable[PointXY]) -> Optional[PointXY]:
-        '''get the line direction toward the endpoint at the optional lookback distance'''
+        '''get the first nonzero line segment pointing toward the endpoint'''
 
-        # set the first point as the endpoint and start walking along the line
         iterator = iter(ordered_points)
-        endpoint = previous = next(iterator)
-        remaining = lookback_distance
+        endpoint = next(iterator)
 
-        # iter over each line segment until the lookback distance is reached
         for point in iterator:
-            # get the length of the current segment
-            length = math.hypot(point[0] - previous[0], point[1] - previous[1])
-
-            # if the segment repeats the previous point, skip it
-            if length == 0:
-                continue
-
-            # if the current segment reaches the lookback distance, use its direction
-            if remaining is None or length >= remaining:
-                # return the segment vector pointing back toward the endpoint
-                return previous[0] - point[0], previous[1] - point[1]
-
-            # remove the current segment length and continue along the line
-            remaining -= length
-            previous = point
-
-        # if a lookback is longer than the line, use the whole line
-        return None if previous == endpoint else (endpoint[0] - previous[0], endpoint[1] - previous[1])
+            if point != endpoint:
+                return endpoint[0] - point[0], endpoint[1] - point[1]
+        return None
 
     start = points[0] # first point
     end = points[-1] # last point
