@@ -53,10 +53,11 @@ class RotateArrowheads:
         field_name = arcpy.Parameter(
             displayName="Rotation field name",
             name="rotation_field",
-            datatype="GPString",
+            datatype="Field",
             parameterType="Required",
             direction="Input",
         )
+        field_name.parameterDependencies = [points.name]
         field_name.value = "rotation_deg"
 
         audit = arcpy.Parameter(
