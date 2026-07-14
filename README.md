@@ -2,6 +2,13 @@
 
 An ArcGIS Pro Python toolbox that rotates arrowhead point features to match nearby line endpoints. It was created to assist the data pipeline of CMS's Global Atlas of Ungulate Migration interactive web map, via the InfoGraphics Lab at the University of Oregon. Created by Owen Ferguson.
 
+## Download
+
+[Download the latest ArcGIS Pro toolbox](https://github.com/owenferg/arrowhead-tools/releases/latest/download/arrowhead-tools-toolbox.zip)
+
+Extract the ZIP, then add `arrowTools.pyt` to the ArcGIS Pro Catalog pane.
+Keep all three extracted files in the same folder.
+
 ## Requirements
 
 - ArcGIS Pro with ArcPy
