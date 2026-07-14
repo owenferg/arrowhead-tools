@@ -1,6 +1,6 @@
-"""
-ArcPy adapter for the arrowhead rotation tool
-"""
+'''
+arcpy adapter for the arrowhead rotation tool
+'''
 
 from __future__ import annotations
 from dataclasses import replace
@@ -134,7 +134,8 @@ def _parts(geometry) -> Iterator[List[Tuple[float, float]]]:
         if points:
             yield points
 
-# def _read_endpoints(line_layer, spatial_reference, lookback_distance: float) -> List[Endpoint]:
+# rotation lookback is disabled while the rotation buffer is in use
+# def _read_endpoints(line_layer, spatial_reference, tangent_distance: float, lookback_distance: float) -> List[Endpoint]:
 def _read_endpoints(line_layer, spatial_reference, tangent_distance: float) -> List[Endpoint]:
     '''read the endpoints from a line layer'''
 
@@ -156,6 +157,7 @@ def _read_endpoints(line_layer, spatial_reference, tangent_distance: float) -> L
                 geometry = geometry.densify('DISTANCE', tangent_distance, 0.0)
             
             for part_index, points in enumerate(_parts(geometry)):
+                # use this call instead to restore the optional lookback direction
                 # lookback_endpoints = endpoints_from_part(
                 #     line_oid, part_index, points, lookback_distance
                 # )
@@ -254,15 +256,22 @@ def _write_rotations(point_layer, field_name: str, matches: Dict[int, Match]) ->
 
     return updated # return the number of updated rows
 
-def _write_audit_table(output_table: str, matches: Dict[int, Match]) -> None:
+def _write_audit_table(output_table: str, point_layer, matches: Dict[int, Match]) -> None:
     '''write the matches to the audit table'''
 
     if arcpy.Exists(output_table):
+        # if overwrite output is disabled, do not delete the existing table
+        if not getattr(getattr(arcpy, 'env', None), 'overwriteOutput', False):
+            raise ValueError(
+                'Audit output table already exists and overwrite output is disabled'
+            )
         arcpy.management.Delete(output_table)
 
     workspace, name = os.path.split(output_table)
     arcpy.management.CreateTable(workspace, name)
-    arcpy.management.AddField(output_table, "POINT_OID", "LONG")
+    # use a matching integer width so 64-bit point object ids do not overflow
+    oid_type = "BIGINTEGER" if getattr(arcpy.Describe(point_layer), 'hasOID64', False) else "LONG"
+    arcpy.management.AddField(output_table, "POINT_OID", oid_type)
     arcpy.management.AddField(output_table, "STATUS", "TEXT", field_length=32)
     arcpy.management.AddField(output_table, "ROTATION", "DOUBLE")
 
@@ -276,6 +285,7 @@ def execute(
     tolerance_text: str,
     field_name: str,
     audit_table: Optional[str],
+    # lookback_text: str = "25 Meters",
     rotation_buffer_text: str = "3",
 ) -> None:
     '''calculate and persist rotations for all selected/input arrowhead points'''
@@ -287,6 +297,14 @@ def execute(
     spatial_reference = _working_spatial_reference(point_layer)
     # convert the match distance into working spatial reference units
     tolerance = _tolerance_in_working_units(tolerance_text, spatial_reference)
+    # convert the rotation buffer into degrees and make sure it is finite
+    try:
+        rotation_buffer = float(rotation_buffer_text)
+    except (TypeError, ValueError):
+        raise ValueError('Rotation buffer must be a number') from None
+    if not math.isfinite(rotation_buffer):
+        raise ValueError('Rotation buffer must be a finite number')
+    # rotation lookback is disabled while the rotation buffer is in use
     # lookback_distance = _tolerance_in_working_units(lookback_text, spatial_reference)
     # get the one meter value for the spatial reference
     one_meter = 1.0 / spatial_reference.metersPerUnit
@@ -303,10 +321,7 @@ def execute(
 
     # calculate the matches for the point layer
     matches = _calculate_matches(point_layer, spatial_reference, EndpointIndex(endpoints, tolerance))
-    # add the rotation buffer to every matched rotation
-    rotation_buffer = float(rotation_buffer_text)
-    if not math.isfinite(rotation_buffer):
-        raise ValueError('Rotation buffer must be a finite number')
+    # add the rotation buffer to every matched rotation and wrap it to 0-360 degrees
     matches = {
         point_oid: replace(match, rotation=(match.rotation + rotation_buffer) % 360.0)
         if match.rotation is not None else match
@@ -318,7 +333,7 @@ def execute(
 
     # if audit table is provided, write the matches to the audit table
     if audit_table:
-        _write_audit_table(audit_table, matches)
+        _write_audit_table(audit_table, point_layer, matches)
 
     # write the rotations to the point layer
     updated = _write_rotations(point_layer, rotation_field, matches)

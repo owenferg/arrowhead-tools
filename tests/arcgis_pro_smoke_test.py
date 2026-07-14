@@ -1,5 +1,5 @@
-"""
-Run from the ArcGIS Pro Python window with
+'''
+run from the ArcGIS Pro Python window with
 
     exec(open(PATH).read())
 
@@ -7,7 +7,7 @@ or from an authorized Python Command Prompt with
 
     propy tests/arcgis_pro_smoke_test.py
 
-"""
+'''
 
 from __future__ import annotations
 import pathlib

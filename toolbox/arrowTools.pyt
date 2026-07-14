@@ -1,7 +1,7 @@
-"""
-Portable ArcGIS Pro Python toolbox to help automate rotating arrowheads.
-Created by Owen Ferguson
-"""
+'''
+portable ArcGIS Pro Python toolbox to help automate rotating arrowheads
+created by Owen Ferguson
+'''
 
 import importlib
 import arcpy
@@ -23,12 +23,13 @@ class RotateArrowheads:
         self.label = "Calculate Arrowhead Rotations"
         self.description = (
             "Matches arrowhead points to nearby line endpoints and writes "
-            "clockwise-from-east rotation values. Uncertain matches are skipped."
+            "clockwise-from-east rotation values with a configurable degree buffer. "
+            "Uncertain matches are skipped."
         )
         self.canRunInBackground = False
 
     def getParameterInfo(self):
-        """Parameters for the arrowhead rotation tool"""
+        '''parameters for the arrowhead rotation tool'''
         points = arcpy.Parameter(
             displayName="Arrowhead points",
             name="arrowhead_points",
@@ -66,6 +67,7 @@ class RotateArrowheads:
         field_name.parameterDependencies = [points.name]
         field_name.value = "Rotation"
 
+        # rotation lookback is disabled while the rotation buffer is in use
         # lookback = arcpy.Parameter(
         #     displayName="Arrowhead rotation lookback distance",
         #     name="rotation_lookback",
@@ -76,7 +78,7 @@ class RotateArrowheads:
         # lookback.value = "25 Meters"
 
         rotation_buffer = arcpy.Parameter(
-            displayName="Rotation buffer (degrees)",
+            displayName="Clockwise rotation buffer (degrees)",
             name="rotation_buffer",
             datatype="GPDouble",
             parameterType="Required",

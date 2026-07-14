@@ -1,10 +1,10 @@
-"""
+'''
 pure python geometry and matching logic for arrowheads
 
 I intentionally didnt include any arcpy dependency so
 the direction math and spatial matching can be tested in any Python runtime.
 Angles use clockwise-from-east: east = 0, positive values rotate clockwise.
-"""
+'''
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -55,7 +55,7 @@ def endpoints_from_part(
     points: Sequence[PointXY],
     lookback_distance: Optional[float] = None,
 ) -> List[Endpoint]:
-    '''create start/end records using the line direction at the visual arrow base'''
+    '''create start/end records using the terminal line direction'''
 
     # if a lookback distance is provided, make sure it is usable
     if lookback_distance is not None and (
@@ -68,7 +68,7 @@ def endpoints_from_part(
         return []
 
     def terminal_vector(ordered_points: Iterable[PointXY]) -> Optional[PointXY]:
-        '''get the line direction toward the endpoint at the lookback distance'''
+        '''get the line direction toward the endpoint at the optional lookback distance'''
 
         # set the first point as the endpoint and start walking along the line
         iterator = iter(ordered_points)
@@ -93,7 +93,7 @@ def endpoints_from_part(
             remaining -= length
             previous = point
 
-        # if the line is shorter than the lookback distance, use the whole line
+        # if a lookback is longer than the line, use the whole line
         return None if previous == endpoint else (endpoint[0] - previous[0], endpoint[1] - previous[1])
 
     start = points[0] # first point

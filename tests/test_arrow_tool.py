@@ -1,6 +1,6 @@
-"""
+'''
 unit tests for arrow_tool.py without requiring an ArcGIS Pro license
-"""
+'''
 
 import importlib
 import pathlib
@@ -66,13 +66,14 @@ class Field:
 
 
 class Dataset:
-    def __init__(self, path, spatial_reference, rows, fields, shape_type):
+    def __init__(self, path, spatial_reference, rows, fields, shape_type, has_oid64=False):
         self.path = path
         self.spatial_reference = spatial_reference
         self.rows = rows
         self.fields = fields
         self.shape_type = shape_type
         self.extent = object()
+        self.has_oid64 = has_oid64
 
 
 class CursorBase:
@@ -127,6 +128,7 @@ def build_fake_arcpy():
     module.datasets = {}
     module.messages = []
     module.warnings = []
+    module.env = types.SimpleNamespace(overwriteOutput=True)
     module.SpatialReference = lambda code: SpatialReference(code)
     module.AddMessage = module.messages.append
     module.AddWarning = module.warnings.append
@@ -144,6 +146,7 @@ def build_fake_arcpy():
             catalogPath=dataset.path,
             extent=dataset.extent,
             hasOID=True,
+            hasOID64=dataset.has_oid64,
             shapeType=dataset.shape_type,
         )
 
@@ -204,7 +207,31 @@ class ArrowToolTests(unittest.TestCase):
         self.assertEqual(self.point_rows[2]["rotation_deg"], 77)
         statuses = [row["STATUS"] for row in self.arcpy.datasets[audit].rows]
         self.assertEqual(statuses, ["MATCHED", "MATCHED", "UNMATCHED"])
+        rotations = [row["ROTATION"] for row in self.arcpy.datasets[audit].rows]
+        self.assertEqual(rotations, [3, 183, None])
         self.assertTrue(any("Updated 2" in message for message in self.arcpy.messages))
+
+    def test_existing_audit_is_preserved_when_overwrite_is_disabled(self):
+        audit = r"C:\test.gdb\arrow_audit"
+        self.arcpy.datasets[audit] = Dataset(audit, None, [{"keep": True}], [], "Table")
+        self.arcpy.env.overwriteOutput = False
+
+        with self.assertRaisesRegex(ValueError, "overwrite output is disabled"):
+            self.tool.execute("points", "lines", "2 Meters", "rotation_deg", audit)
+
+        self.assertEqual(self.arcpy.datasets[audit].rows, [{"keep": True}])
+
+    def test_audit_uses_big_integer_for_64_bit_point_ids(self):
+        audit = r"C:\test.gdb\arrow_audit"
+        self.arcpy.datasets["points"].has_oid64 = True
+
+        self.tool.execute("points", "lines", "2 Meters", "rotation_deg", audit)
+
+        point_oid = next(
+            field for field in self.arcpy.datasets[audit].fields
+            if field.name == "POINT_OID"
+        )
+        self.assertEqual(point_oid.type, "Biginteger")
 
     def test_new_rotation_field_is_created(self):
         self.arcpy.datasets["points"].fields.pop()
@@ -220,6 +247,14 @@ class ArrowToolTests(unittest.TestCase):
         )
         self.assertEqual(self.point_rows[0]["rotation_deg"], 355)
         self.assertEqual(self.point_rows[1]["rotation_deg"], 175)
+
+    def test_invalid_rotation_buffer_is_rejected_before_update(self):
+        for value, message in (("nan", "finite number"), ("abc", "must be a number")):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, message):
+                self.tool.execute(
+                    "points", "lines", "2 Meters", "rotation_deg", None, value
+                )
+        self.assertEqual(self.point_rows[0]["rotation_deg"], 33)
 
     def test_non_numeric_rotation_field_is_rejected_before_update(self):
         self.arcpy.datasets["points"].fields[-1].type = "String"
