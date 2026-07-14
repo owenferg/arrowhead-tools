@@ -281,6 +281,7 @@ def execute(
     tolerance = _tolerance_in_working_units(tolerance_text, spatial_reference)
     # convert the arrowhead lookback into working spatial reference units
     lookback_distance = _tolerance_in_working_units(lookback_text, spatial_reference)
+    arcpy.AddMessage(f'Using a {lookback_text} arrowhead rotation lookback')
     # read the endpoints from the line layer
     endpoints = _read_endpoints(line_layer, spatial_reference, lookback_distance)
 

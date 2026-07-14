@@ -214,6 +214,25 @@ class ArrowToolTests(unittest.TestCase):
         self.assertEqual(self.point_rows[0]["new_angle"], 0)
         self.assertEqual(self.point_rows[2]["new_angle"], None)
 
+    def test_lookback_changes_rotation_on_a_curved_line(self):
+        self.point_rows[0]["geometry"] = Geometry(
+            self.point_rows[0]["geometry"].spatialReference, point=(20, 10)
+        )
+        self.arcpy.datasets["lines"].rows[0]["geometry"] = Geometry(
+            self.point_rows[0]["geometry"].spatialReference,
+            parts=[[(0, 0), (0, 10), (10, 10), (20, 10)]],
+        )
+
+        self.tool.execute(
+            "points", "lines", "2 Meters", "rotation_deg", None, "5 Meters"
+        )
+        self.assertEqual(self.point_rows[0]["rotation_deg"], 0)
+
+        self.tool.execute(
+            "points", "lines", "2 Meters", "rotation_deg", None, "25 Meters"
+        )
+        self.assertEqual(self.point_rows[0]["rotation_deg"], 270)
+
     def test_non_numeric_rotation_field_is_rejected_before_update(self):
         self.arcpy.datasets["points"].fields[-1].type = "String"
         with self.assertRaisesRegex(ValueError, "must be numeric"):

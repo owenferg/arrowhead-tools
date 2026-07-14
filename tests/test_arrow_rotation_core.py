@@ -48,8 +48,8 @@ class EndpointTests(unittest.TestCase):
         endpoints = endpoints_from_part(
             7, 0, [(0, 0), (0, 4), (2, 4), (4, 4)], 5
         )
-        self.assertEqual((endpoints[0].dx, endpoints[0].dy), (-1, -4))
-        self.assertEqual((endpoints[1].dx, endpoints[1].dy), (4, 1))
+        self.assertEqual((endpoints[0].dx, endpoints[0].dy), (-2, 0))
+        self.assertEqual((endpoints[1].dx, endpoints[1].dy), (0, 4))
 
     def test_lookback_longer_than_line_uses_the_whole_line(self):
         endpoints = endpoints_from_part(7, 0, [(0, 0), (3, 4)], 10)

@@ -55,7 +55,7 @@ def endpoints_from_part(
     points: Sequence[PointXY],
     lookback_distance: Optional[float] = None,
 ) -> List[Endpoint]:
-    '''create start/end records using vectors spanning the visual arrow footprint'''
+    '''create start/end records using the line direction at the visual arrow base'''
 
     # if a lookback distance is provided, make sure it is usable
     if lookback_distance is not None and (
@@ -68,7 +68,7 @@ def endpoints_from_part(
         return []
 
     def terminal_vector(ordered_points: Iterable[PointXY]) -> Optional[PointXY]:
-        '''get the vector from the lookback point toward the endpoint'''
+        '''get the line direction toward the endpoint at the lookback distance'''
 
         # set the first point as the endpoint and start walking along the line
         iterator = iter(ordered_points)
@@ -84,18 +84,10 @@ def endpoints_from_part(
             if length == 0:
                 continue
 
-            # if the current segment reaches the lookback distance, interpolate the point
+            # if the current segment reaches the lookback distance, use its direction
             if remaining is None or length >= remaining:
-                # use the first full segment when no lookback distance was provided
-                distance = length if remaining is None else remaining
-                fraction = distance / length
-                sample = (
-                    previous[0] + (point[0] - previous[0]) * fraction,
-                    previous[1] + (point[1] - previous[1]) * fraction,
-                )
-
-                # return the vector pointing from the sample toward the endpoint
-                return endpoint[0] - sample[0], endpoint[1] - sample[1]
+                # return the segment vector pointing back toward the endpoint
+                return previous[0] - point[0], previous[1] - point[1]
 
             # remove the current segment length and continue along the line
             remaining -= length

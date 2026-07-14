@@ -64,7 +64,7 @@ class RotateArrowheads:
             direction="Input",
         )
         field_name.parameterDependencies = [points.name]
-        field_name.value = "rotation_deg"
+        field_name.value = "Rotation"
 
         lookback = arcpy.Parameter(
             displayName="Arrowhead rotation lookback distance",
