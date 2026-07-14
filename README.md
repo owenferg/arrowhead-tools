@@ -29,6 +29,8 @@ In ArcGIS Pro, add `arrow_tools.pyt` to the Catalog pane and open **Calculate Ar
 
 ## Use
 
+See `README.txt` in the download folder for step-by-step instructions for use in ArcGIS Pro.
+
 The tool accepts:
 
 - **Arrowhead points:** point features that are updated in place.
