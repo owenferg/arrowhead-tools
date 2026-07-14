@@ -49,7 +49,7 @@ def run() -> None:
             rows.insertRow((line,))
 
         arrow_tool.execute(
-            points, lines, "2 Meters", "rotation_deg", audit
+            points, lines, "2 Meters", "rotation_deg", audit, "5 Meters"
         )
         rotations = [
             value for (value,) in arcpy.da.SearchCursor(

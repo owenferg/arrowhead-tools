@@ -60,6 +60,15 @@ class RotateArrowheads:
         field_name.parameterDependencies = [points.name]
         field_name.value = "rotation_deg"
 
+        lookback = arcpy.Parameter(
+            displayName="Arrowhead rotation lookback distance",
+            name="rotation_lookback",
+            datatype="GPLinearUnit",
+            parameterType="Required",
+            direction="Input",
+        )
+        lookback.value = "25 Meters"
+
         audit = arcpy.Parameter(
             displayName="Audit output table",
             name="audit_table",
@@ -77,7 +86,7 @@ class RotateArrowheads:
         derived.parameterDependencies = [points.name]
         derived.schema.clone = True
 
-        return [points, lines, tolerance, field_name, audit, derived]
+        return [points, lines, tolerance, field_name, lookback, audit, derived]
 
     def isLicensed(self):
         return True
@@ -94,9 +103,10 @@ class RotateArrowheads:
                 parameters[1].valueAsText, # lines
                 parameters[2].valueAsText, # maximum endpoint match distance
                 parameters[3].valueAsText, # rotation field name
-                parameters[4].valueAsText, # audit output table
+                parameters[5].valueAsText, # audit output table
+                parameters[4].valueAsText, # arrowhead rotation lookback distance
             )
-            parameters[5].value = parameters[0].value # updated arrowhead layer
+            parameters[6].value = parameters[0].value # updated arrowhead layer
         
         except Exception as exc:
             arcpy.AddError(str(exc))

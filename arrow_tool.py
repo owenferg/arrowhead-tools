@@ -127,7 +127,7 @@ def _parts(geometry) -> Iterator[List[Tuple[float, float]]]:
         if points:
             yield points
 
-def _read_endpoints(line_layer, spatial_reference, tangent_distance: float) -> List[Endpoint]:
+def _read_endpoints(line_layer, spatial_reference, lookback_distance: float) -> List[Endpoint]:
     '''read the endpoints from a line layer'''
 
     endpoints: List[Endpoint] = [] 
@@ -144,11 +144,14 @@ def _read_endpoints(line_layer, spatial_reference, tangent_distance: float) -> L
             geometry = _project_if_needed(geometry, spatial_reference, transformation)
 
             if getattr(geometry, 'hasCurves', False):
-                # densify the geometry if it has curves
-                geometry = geometry.densify('DISTANCE', tangent_distance, 0.0)
+                # densify the geometry if it has curves, using ten points per lookback distance
+                geometry = geometry.densify('DISTANCE', lookback_distance / 10.0, 0.0)
             
             for part_index, points in enumerate(_parts(geometry)):
-                endpoints.extend(endpoints_from_part(line_oid, part_index, points))
+                # add the endpoints using the arrowhead lookback distance
+                endpoints.extend(
+                    endpoints_from_part(line_oid, part_index, points, lookback_distance)
+                )
 
     return endpoints
 
@@ -259,7 +262,14 @@ def _write_audit_table(output_table: str, matches: Dict[int, Match]) -> None:
         for point_oid, match in matches.items():
             rows.insertRow((point_oid, match.status, match.rotation))
 
-def execute(point_layer, line_layer, tolerance_text: str, field_name: str, audit_table: Optional[str]) -> None:
+def execute(
+    point_layer,
+    line_layer,
+    tolerance_text: str,
+    field_name: str,
+    audit_table: Optional[str],
+    lookback_text: str = "25 Meters",
+) -> None:
     '''calculate and persist rotations for all selected/input arrowhead points'''
 
     # validate the point layer is editable
@@ -267,13 +277,12 @@ def execute(point_layer, line_layer, tolerance_text: str, field_name: str, audit
 
     # get the spatial reference for the point layer
     spatial_reference = _working_spatial_reference(point_layer)
+    # convert the match distance into working spatial reference units
     tolerance = _tolerance_in_working_units(tolerance_text, spatial_reference)
-    # get the one meter value for the spatial reference
-    one_meter = 1.0 / spatial_reference.metersPerUnit
-    # get the tangent distance for the line layer
-    tangent_distance = max(min(tolerance / 10.0, one_meter), 1e-9)
+    # convert the arrowhead lookback into working spatial reference units
+    lookback_distance = _tolerance_in_working_units(lookback_text, spatial_reference)
     # read the endpoints from the line layer
-    endpoints = _read_endpoints(line_layer, spatial_reference, tangent_distance)
+    endpoints = _read_endpoints(line_layer, spatial_reference, lookback_distance)
 
     if not endpoints:
         # if no endpoints were found, raise an error

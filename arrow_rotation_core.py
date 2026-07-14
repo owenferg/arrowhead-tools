@@ -53,30 +53,75 @@ def endpoints_from_part(
     line_oid: int,
     part_index: int,
     points: Sequence[PointXY],
+    lookback_distance: Optional[float] = None,
 ) -> List[Endpoint]:
-    '''create start/end records, skipping repeated terminal coordinates'''
+    '''create start/end records using vectors spanning the visual arrow footprint'''
 
+    # if a lookback distance is provided, make sure it is usable
+    if lookback_distance is not None and (
+        not math.isfinite(lookback_distance) or lookback_distance <= 0
+    ):
+        raise ValueError('Lookback distance must be a positive finite number')
+
+    # if the part has fewer than two points or is closed, there are no usable endpoints
     if len(points)<2 or points[0] == points[-1]:
         return []
 
+    def terminal_vector(ordered_points: Iterable[PointXY]) -> Optional[PointXY]:
+        '''get the vector from the lookback point toward the endpoint'''
+
+        # set the first point as the endpoint and start walking along the line
+        iterator = iter(ordered_points)
+        endpoint = previous = next(iterator)
+        remaining = lookback_distance
+
+        # iter over each line segment until the lookback distance is reached
+        for point in iterator:
+            # get the length of the current segment
+            length = math.hypot(point[0] - previous[0], point[1] - previous[1])
+
+            # if the segment repeats the previous point, skip it
+            if length == 0:
+                continue
+
+            # if the current segment reaches the lookback distance, interpolate the point
+            if remaining is None or length >= remaining:
+                # use the first full segment when no lookback distance was provided
+                distance = length if remaining is None else remaining
+                fraction = distance / length
+                sample = (
+                    previous[0] + (point[0] - previous[0]) * fraction,
+                    previous[1] + (point[1] - previous[1]) * fraction,
+                )
+
+                # return the vector pointing from the sample toward the endpoint
+                return endpoint[0] - sample[0], endpoint[1] - sample[1]
+
+            # remove the current segment length and continue along the line
+            remaining -= length
+            previous = point
+
+        # if the line is shorter than the lookback distance, use the whole line
+        return None if previous == endpoint else (endpoint[0] - previous[0], endpoint[1] - previous[1])
+
     start = points[0] # first point
-    start_neighbor = next((point for point in points[1:] if point != start), None) # second point
     end = points[-1] # last point
-    end_neighbor = next((point for point in reversed(points[:-1]) if point != end), None) # second-to-last point
+    start_vector = terminal_vector(points) # vector pointing toward the start
+    end_vector = terminal_vector(reversed(points)) # vector pointing toward the end
 
     records: List[Endpoint] = []
-    if start_neighbor is not None: # if there is a second point, add a start record
+    if start_vector is not None: # if there is a start vector, add a start record
         records.append(
             Endpoint(
                 line_oid, part_index, 'START', start[0], start[1],
-                start[0] - start_neighbor[0], start[1] - start_neighbor[1],
+                start_vector[0], start_vector[1],
             )
         )
-    if end_neighbor is not None: # if there is a second-to-last point, add an end record
+    if end_vector is not None: # if there is an end vector, add an end record
         records.append(
             Endpoint(
                 line_oid, part_index, 'END', end[0], end[1],
-                end[0] - end_neighbor[0], end[1] - end_neighbor[1],
+                end_vector[0], end_vector[1],
             )
         )
     return records
