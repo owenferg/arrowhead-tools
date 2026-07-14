@@ -199,8 +199,8 @@ class ArrowToolTests(unittest.TestCase):
         audit = r"C:\test.gdb\arrow_audit"
         self.tool.execute("points", "lines", "2 Meters", "rotation_deg", audit)
 
-        self.assertEqual(self.point_rows[0]["rotation_deg"], 0)
-        self.assertEqual(self.point_rows[1]["rotation_deg"], 180)
+        self.assertEqual(self.point_rows[0]["rotation_deg"], 3)
+        self.assertEqual(self.point_rows[1]["rotation_deg"], 183)
         self.assertEqual(self.point_rows[2]["rotation_deg"], 77)
         statuses = [row["STATUS"] for row in self.arcpy.datasets[audit].rows]
         self.assertEqual(statuses, ["MATCHED", "MATCHED", "UNMATCHED"])
@@ -211,30 +211,15 @@ class ArrowToolTests(unittest.TestCase):
         for row in self.point_rows:
             row.pop("rotation_deg")
         self.tool.execute("points", "lines", "2 Meters", "new_angle", None)
-        self.assertEqual(self.point_rows[0]["new_angle"], 0)
+        self.assertEqual(self.point_rows[0]["new_angle"], 3)
         self.assertEqual(self.point_rows[2]["new_angle"], None)
 
-    def test_lookback_changes_rotation_on_a_curved_line(self):
-        self.point_rows[0]["geometry"] = Geometry(
-            self.point_rows[0]["geometry"].spatialReference, point=(20, 10)
-        )
-        self.arcpy.datasets["lines"].rows[0]["geometry"] = Geometry(
-            self.point_rows[0]["geometry"].spatialReference,
-            parts=[[(0, 0), (0, 10), (10, 10), (20, 10)]],
-        )
-
+    def test_rotation_buffer_is_modifiable_and_wraps(self):
         self.tool.execute(
-            "points", "lines", "2 Meters", "rotation_deg", None, "5 Meters"
+            "points", "lines", "2 Meters", "rotation_deg", None, "-5"
         )
-        self.assertEqual(self.point_rows[0]["rotation_deg"], 0)
-
-        self.tool.execute(
-            "points", "lines", "2 Meters", "rotation_deg", None, "25 Meters"
-        )
-        self.assertEqual(self.point_rows[0]["rotation_deg"], 270)
-        self.assertTrue(
-            any("changed direction at 2 of 2" in message for message in self.arcpy.messages)
-        )
+        self.assertEqual(self.point_rows[0]["rotation_deg"], 355)
+        self.assertEqual(self.point_rows[1]["rotation_deg"], 175)
 
     def test_non_numeric_rotation_field_is_rejected_before_update(self):
         self.arcpy.datasets["points"].fields[-1].type = "String"

@@ -3,6 +3,7 @@ ArcPy adapter for the arrowhead rotation tool
 """
 
 from __future__ import annotations
+from dataclasses import replace
 import math
 import os
 from typing import Dict, Iterator, List, Optional, Tuple
@@ -11,7 +12,6 @@ from arrow_rotation_core import (
     Endpoint,
     EndpointIndex,
     Match,
-    clockwise_angle_from_east,
     endpoints_from_part,
 )
 
@@ -134,11 +134,11 @@ def _parts(geometry) -> Iterator[List[Tuple[float, float]]]:
         if points:
             yield points
 
-def _read_endpoints(line_layer, spatial_reference, lookback_distance: float) -> List[Endpoint]:
+# def _read_endpoints(line_layer, spatial_reference, lookback_distance: float) -> List[Endpoint]:
+def _read_endpoints(line_layer, spatial_reference, tangent_distance: float) -> List[Endpoint]:
     '''read the endpoints from a line layer'''
 
     endpoints: List[Endpoint] = []
-    changed_directions = 0
     # get the transformation for the line layer
     transformation = _projection_for_layer(line_layer, spatial_reference)
 
@@ -152,33 +152,14 @@ def _read_endpoints(line_layer, spatial_reference, lookback_distance: float) -> 
             geometry = _project_if_needed(geometry, spatial_reference, transformation)
 
             if getattr(geometry, 'hasCurves', False):
-                # densify the geometry if it has curves, using ten points per lookback distance
-                geometry = geometry.densify('DISTANCE', lookback_distance / 10.0, 0.0)
+                # densify the geometry if it has curves
+                geometry = geometry.densify('DISTANCE', tangent_distance, 0.0)
             
             for part_index, points in enumerate(_parts(geometry)):
-                # add the endpoints using the arrowhead lookback distance
-                lookback_endpoints = endpoints_from_part(
-                    line_oid, part_index, points, lookback_distance
-                )
-                terminal_endpoints = endpoints_from_part(line_oid, part_index, points)
-                endpoints.extend(lookback_endpoints)
-
-                # compare the lookback directions to the absolute endpoint directions
-                for lookback, terminal in zip(lookback_endpoints, terminal_endpoints):
-                    lookback_angle = clockwise_angle_from_east(lookback.dx, lookback.dy)
-                    terminal_angle = clockwise_angle_from_east(terminal.dx, terminal.dy)
-                    if not math.isclose(lookback_angle, terminal_angle, abs_tol=1e-9):
-                        changed_directions += 1
-
-    arcpy.AddMessage(
-        f'Lookback changed direction at {changed_directions:,} of '
-        f'{len(endpoints):,} line endpoints'
-    )
-    if endpoints and changed_directions == 0:
-        arcpy.AddWarning(
-            'The lookback did not reach a different line direction at any endpoint; '
-            'increase the distance or use lines with more detailed terminal geometry'
-        )
+                # lookback_endpoints = endpoints_from_part(
+                #     line_oid, part_index, points, lookback_distance
+                # )
+                endpoints.extend(endpoints_from_part(line_oid, part_index, points))
 
     return endpoints
 
@@ -295,7 +276,7 @@ def execute(
     tolerance_text: str,
     field_name: str,
     audit_table: Optional[str],
-    lookback_text: str = "25 Meters",
+    rotation_buffer_text: str = "3",
 ) -> None:
     '''calculate and persist rotations for all selected/input arrowhead points'''
 
@@ -306,11 +287,13 @@ def execute(
     spatial_reference = _working_spatial_reference(point_layer)
     # convert the match distance into working spatial reference units
     tolerance = _tolerance_in_working_units(tolerance_text, spatial_reference)
-    # convert the arrowhead lookback into working spatial reference units
-    lookback_distance = _tolerance_in_working_units(lookback_text, spatial_reference)
-    arcpy.AddMessage(f'Using a {lookback_text} arrowhead rotation lookback')
+    # lookback_distance = _tolerance_in_working_units(lookback_text, spatial_reference)
+    # get the one meter value for the spatial reference
+    one_meter = 1.0 / spatial_reference.metersPerUnit
+    # get the tangent distance for curved line endpoints
+    tangent_distance = max(min(tolerance / 10.0, one_meter), 1e-9)
     # read the endpoints from the line layer
-    endpoints = _read_endpoints(line_layer, spatial_reference, lookback_distance)
+    endpoints = _read_endpoints(line_layer, spatial_reference, tangent_distance)
 
     if not endpoints:
         # if no endpoints were found, raise an error
@@ -320,6 +303,16 @@ def execute(
 
     # calculate the matches for the point layer
     matches = _calculate_matches(point_layer, spatial_reference, EndpointIndex(endpoints, tolerance))
+    # add the rotation buffer to every matched rotation
+    rotation_buffer = float(rotation_buffer_text)
+    if not math.isfinite(rotation_buffer):
+        raise ValueError('Rotation buffer must be a finite number')
+    matches = {
+        point_oid: replace(match, rotation=(match.rotation + rotation_buffer) % 360.0)
+        if match.rotation is not None else match
+        for point_oid, match in matches.items()
+    }
+    arcpy.AddMessage(f'Applied a {rotation_buffer:+g} degree rotation buffer')
     # ensure the rotation field exists and is numeric and editable
     rotation_field = _ensure_rotation_field(point_layer, field_name)
 

@@ -49,14 +49,14 @@ def run() -> None:
             rows.insertRow((line,))
 
         arrow_tool.execute(
-            points, lines, "2 Meters", "rotation_deg", audit, "5 Meters"
+            points, lines, "2 Meters", "rotation_deg", audit
         )
         rotations = [
             value for (value,) in arcpy.da.SearchCursor(
                 points, ["rotation_deg"], sql_clause=(None, "ORDER BY OBJECTID")
             )
         ]
-        assert rotations == [0.0, 180.0, 77.0], rotations
+        assert rotations == [3.0, 183.0, 77.0], rotations
         statuses = sorted(
             status for (status,) in arcpy.da.SearchCursor(audit, ["STATUS"])
         )
