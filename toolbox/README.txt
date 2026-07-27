@@ -15,7 +15,7 @@ two tools depending on what data you have.
 
 Create arrowheads when you only have lines:
 
-Open Create Arrowheads from Line Endpoints.
+Open "Create Arrowheads from Line Endpoints"
 
 - Lines: select the layer that contains the arrow lines. Any selection or definition
 query on the layer will be honored.
@@ -35,7 +35,7 @@ marker in the layer's symbology and use the rotation field to rotate it.
 
 Update rotations when you already have arrowhead points:
 
-Open Update Existing Arrowhead Rotations.
+Open "Update Existing Arrowhead Rotations"
 
 - Arrowhead points: select your layer that contains the arrowhead points
 - Lines: select your layer that contains the arrow's lines
@@ -49,8 +49,11 @@ your discretion.
 - Audit output table: Optional; creates a table that contains information about the
 results of executing the script.
 
-When parameters are set to your preference, press "Run". Changes should be reflected 
-automatically visually and in the attribute table of your arrowheads layer.
+When parameters are set to your preference, press "Run". 
+
+To see changes for either Python script,
+go to the layer's Symbology and go to the "Vary symbol by attribute" tab.
+Pick the rotation field and set the rotation to Geographic.
 
 Any questions? Reach out to Owen Ferguson:
 owenf@uoregon.edu
