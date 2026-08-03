@@ -67,7 +67,7 @@ go to the layer's Symbology and go to the "Vary symbol by attribute" tab.
 Pick the rotation field and set the rotation to Geographic.
 
 Any questions? Reach out to Owen Ferguson:
-ferguson.owen555@gmail.com
+owen@owenferg.com
 owenf@uoregon.edu
 
 Visit the Github repository for more information:
