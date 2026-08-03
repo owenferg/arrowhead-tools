@@ -15,7 +15,7 @@ How to use:
 4. The toolbox should now appear under Toolboxes. Expand arrow_tools.pyt. There are
 two tools depending on what data you have.
 
-Create arrowheads when you only have lines:
+For creating arrowheads when you only have lines:
 
 Open "Create Arrowheads from Line Endpoints"
 
@@ -29,9 +29,10 @@ true/false. True creates arrowheads at both ends of the line, while false create
 arrowhead at the end only. Text matching is case-insensitive and ignores surrounding
 spaces. Nulls and other values are rejected.
 - Rotation field name: the field in the new layer that will contain rotation values.
+Default is "Rotation"; update this field if you would prefer a different field name.
 - Rotation buffer (degrees): a buffer that adjusts each arrow by a certain amount of
-degrees. I found the default of 3 to produce best results, but can be modified at
-your discretion.
+degrees. I found the default of 3 to produce best results, but change to 0 if you think
+the arrowheads are off (or any other integer).
 - Output arrowheads: location and name for the new arrowhead point layer. By default,
 the name is your arrow line layer followed by _Arrowheads.
 
@@ -41,31 +42,35 @@ CUSTOM applies the line's placement value to every open part. The script creates
 rotation-ready data, but does not choose your arrowhead symbol. Set up your preferred
 marker in the layer's symbology and use the rotation field to rotate it.
 
-Update rotations when you already have arrowhead points:
+For updating rotations when you already have arrowhead points:
 
 Open "Update Existing Arrowhead Rotations"
 
-- Arrowhead points: select your layer that contains the arrowhead points
-- Lines: select your layer that contains the arrow's lines
+- Arrowhead points: select your layer that contains the arrowhead points.
+- Lines: select your layer that contains the arrow's lines.
 - Maximum endpoint distance: determines how far the script searches for an endpoint 
-of a line from the arrowhead point. I recommend not changing this.
-- Rotation field: The field from your arrowhead points layer that determines rotation 
-values. Choose from the dropdown if the default "Rotation" isn't accurate.
-- Rotation buffer (degrees): A buffer that adjusts each arrow by a certain amount of 
-degrees. I found the default of 3 to produce best results, but can be modified at 
-your discretion.
+of a line from the arrowhead point. I recommend not changing this unless you have points
+that are not directly on the start or ending points of your lines.
+- Rotation field: the field from your arrowhead points layer that determines rotation 
+values. Choose from the dropdown if the default "Rotation" isn't accurate (ArcGIS Pro
+will give you a warning if this is the case).
+- Rotation buffer (degrees): a buffer that adjusts each arrow by a certain amount of
+degrees. I found the default of 3 to produce best results, but change to 0 if you think
+the arrowheads are off (or any other integer).
 - Audit output table: Optional; creates a table that contains information about the
-results of executing the script.
+results of executing the script. Mostly just for debugging.
 
 When parameters are set to your preference, press "Run". 
 
-To see changes for either Python script,
+To see changes for either Python script reflected in ArcGIS Pro,
 go to the layer's Symbology and go to the "Vary symbol by attribute" tab.
 Pick the rotation field and set the rotation to Geographic.
 
 Any questions? Reach out to Owen Ferguson:
-owenf@uoregon.edu
 ferguson.owen555@gmail.com
+owenf@uoregon.edu
 
 Visit the Github repository for more information:
 https://github.com/owenferg/arrowhead-tools
+
+Arrowhead Tools v1.3
