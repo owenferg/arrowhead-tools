@@ -32,6 +32,8 @@ def run() -> None:
         audit = str(pathlib.Path(geodatabase) / "arrow_audit")
         created_ends = str(pathlib.Path(geodatabase) / "created_ends")
         created_both = str(pathlib.Path(geodatabase) / "created_both")
+        created_custom_end = str(pathlib.Path(geodatabase) / "created_custom_end")
+        created_custom_both = str(pathlib.Path(geodatabase) / "created_custom_both")
         arcpy.management.CreateFeatureclass(
             geodatabase, "arrowheads", "POINT", spatial_reference=spatial_reference
         )
@@ -40,6 +42,7 @@ def run() -> None:
         )
         arcpy.management.AddField(points, "rotation_deg", "DOUBLE")
         arcpy.management.AddField(lines, "LINE_NAME", "TEXT", field_length=40)
+        arcpy.management.AddField(lines, "BOTH_ENDS", "SHORT")
 
         with arcpy.da.InsertCursor(points, ["SHAPE@XY", "rotation_deg"]) as rows:
             rows.insertRow(((10.0, 0.0), 33.0))
@@ -49,8 +52,8 @@ def run() -> None:
             arcpy.Array([arcpy.Point(0.0, 0.0), arcpy.Point(10.0, 0.0)]),
             spatial_reference,
         )
-        with arcpy.da.InsertCursor(lines, ["SHAPE@", "LINE_NAME"]) as rows:
-            rows.insertRow((line, "Smoke test line"))
+        with arcpy.da.InsertCursor(lines, ["SHAPE@", "LINE_NAME", "BOTH_ENDS"]) as rows:
+            rows.insertRow((line, "Smoke test line", 0))
 
         arrow_rotation_arcpy.execute(
             points, lines, "2 Meters", "rotation_deg", audit
@@ -92,6 +95,40 @@ def run() -> None:
             ((10.0, 0.0), 3.0, "END"),
             ((0.0, 0.0), 183.0, "START"),
         ], both_rows
+
+        arrow_creation_arcpy.execute(
+            lines, "CUSTOM", "Rotation", "3", created_custom_end,
+            custom_field="BOTH_ENDS",
+        )
+        custom_end_rows = list(
+            arcpy.da.SearchCursor(
+                created_custom_end, ["SHAPE@XY", "Rotation", "ENDPOINT", "BOTH_ENDS"]
+            )
+        )
+        assert custom_end_rows == [
+            ((10.0, 0.0), 3.0, "END", 0)
+        ], custom_end_rows
+
+        with arcpy.da.UpdateCursor(lines, ["BOTH_ENDS"]) as rows:
+            for row in rows:
+                row[0] = 1
+                rows.updateRow(row)
+
+        arrow_creation_arcpy.execute(
+            lines, "CUSTOM", "Rotation", "3", created_custom_both,
+            custom_field="BOTH_ENDS",
+        )
+        custom_both_rows = sorted(
+            arcpy.da.SearchCursor(
+                created_custom_both, ["SHAPE@XY", "Rotation", "ENDPOINT", "BOTH_ENDS"]
+            ),
+            key=lambda row: row[2],
+        )
+        assert custom_both_rows == [
+            ((10.0, 0.0), 3.0, "END", 1),
+            ((0.0, 0.0), 183.0, "START", 1),
+        ], custom_both_rows
+
         arcpy.management.ClearWorkspaceCache()
         print("ArcGIS Pro smoke test passed")
 

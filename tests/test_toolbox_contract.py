@@ -24,6 +24,7 @@ class Parameter:
         self.schema = types.SimpleNamespace(clone=False)
         self.value = None
         self.altered = False
+        self.enabled = True
         self.error = None
 
     @property
@@ -105,30 +106,67 @@ class ToolboxContractTests(unittest.TestCase):
             [
                 "lines",
                 "placement",
+                "custom_placement_field",
                 "rotation_field",
                 "rotation_buffer",
                 "output_arrowheads",
             ],
         )
         self.assertEqual(parameters[0].filter.list, ["Polyline"])
-        self.assertEqual(parameters[1].filter.list, ["START", "END", "BOTH"])
+        self.assertEqual(
+            parameters[1].filter.list,
+            ["START", "END", "BOTH", "CUSTOM"],
+        )
         self.assertEqual(parameters[1].value, "END")
-        self.assertEqual(parameters[2].value, "Rotation")
-        self.assertEqual(parameters[3].value, 3)
-        self.assertEqual(parameters[4].schema.geometryType, "Point")
+        self.assertEqual(parameters[2].parameterDependencies, ["lines"])
+        self.assertEqual(
+            parameters[2].filter.list,
+            ["Short", "Long", "BigInteger", "Text"],
+        )
+        self.assertFalse(parameters[2].enabled)
+        self.assertEqual(parameters[3].value, "Rotation")
+        self.assertEqual(parameters[4].value, 3)
+        self.assertEqual(parameters[5].schema.geometryType, "Point")
 
-        values = ["lines", "BOTH", "MapRotation", "-4", "new_arrowheads"]
+        values = [
+            "lines", "CUSTOM", "BothEnds", "MapRotation", "-4", "new_arrowheads",
+        ]
         for parameter, value in zip(parameters, values):
             parameter.value = value
 
         forwarded = []
-        self.toolbox.arrow_creation_arcpy.execute = lambda *args: forwarded.append(args)
+        self.toolbox.arrow_creation_arcpy.execute = (
+            lambda *args, **kwargs: forwarded.append((args, kwargs))
+        )
         self.toolbox.CreateArrowheadsFromLineEndpoints().execute(parameters, None)
 
         self.assertEqual(
             forwarded,
-            [("lines", "BOTH", "MapRotation", "-4", "new_arrowheads")],
+            [(
+                ("lines", "CUSTOM", "MapRotation", "-4", "new_arrowheads"),
+                {"custom_field": "BothEnds"},
+            )],
         )
+
+    def test_custom_creation_field_is_enabled_and_required_only_for_custom(self):
+        tool = self.toolbox.CreateArrowheadsFromLineEndpoints()
+        parameters = tool.getParameterInfo()
+
+        parameters[1].value = "CUSTOM"
+        tool.updateParameters(parameters)
+        tool.updateMessages(parameters)
+        self.assertTrue(parameters[2].enabled)
+        self.assertEqual(
+            parameters[2].error,
+            "Custom placement field is required for CUSTOM placement",
+        )
+
+        parameters[2].value = "BothEnds"
+        tool.updateMessages(parameters)
+        parameters[1].value = "END"
+        tool.updateParameters(parameters)
+        self.assertFalse(parameters[2].enabled)
+        self.assertEqual(parameters[2].value, "BothEnds")
 
     def test_creation_output_default_tracks_input_until_user_edits_it(self):
         tool = self.toolbox.CreateArrowheadsFromLineEndpoints()
@@ -138,26 +176,26 @@ class ToolboxContractTests(unittest.TestCase):
         parameters[0].value = str(roads)
         tool.updateParameters(parameters)
         self.assertEqual(
-            parameters[4].value,
+            parameters[5].value,
             str(self.workspace / "Roads_Arrowheads"),
         )
 
         trails = self.workspace / "Trail Lines"
         # ArcGIS can mark values assigned during validation as altered
-        parameters[4].altered = True
+        parameters[5].altered = True
         parameters[0].value = str(trails)
         tool.updateParameters(parameters)
         self.assertEqual(
-            parameters[4].value,
+            parameters[5].value,
             str(self.workspace / "Trail_Lines_Arrowheads"),
         )
 
-        parameters[4].value = str(self.workspace / "My_Custom_Output")
-        parameters[4].altered = True
+        parameters[5].value = str(self.workspace / "My_Custom_Output")
+        parameters[5].altered = True
         parameters[0].value = str(self.workspace / "Streams")
         tool.updateParameters(parameters)
         self.assertEqual(
-            parameters[4].value,
+            parameters[5].value,
             str(self.workspace / "My_Custom_Output"),
         )
 
@@ -169,7 +207,7 @@ class ToolboxContractTests(unittest.TestCase):
         tool.updateParameters(parameters)
 
         self.assertEqual(
-            parameters[4].value,
+            parameters[5].value,
             str(pathlib.Path(self.temp_directory.name) / "Roads_Arrowheads.shp"),
         )
 
@@ -183,7 +221,7 @@ class ToolboxContractTests(unittest.TestCase):
         tool.updateParameters(parameters)
 
         self.assertEqual(
-            parameters[4].value,
+            parameters[5].value,
             str(self.project_workspace / "Roads_Arrowheads"),
         )
 

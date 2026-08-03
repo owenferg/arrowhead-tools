@@ -258,6 +258,93 @@ class ArrowCreationTests(unittest.TestCase):
         self.assertEqual([row['ENDPOINT'] for row in rows], ['START', 'END'])
         self.assertEqual([row['Angle'] for row in rows], [175, 355])
 
+    def test_custom_uses_boolean_values_for_each_line_and_part(self):
+        dataset = self.arcpy.datasets[self.lines]
+        dataset.fields.append(Field('BothEnds', 'SmallInteger'))
+        dataset.rows[0]['BothEnds'] = True
+        dataset.rows.append({
+            'oid': 10,
+            'geometry': Geometry(self.sr, parts=[[(20, 0), (30, 0)]]),
+            'RoadName': 'Second',
+            'BothEnds': 0,
+        })
+
+        self.tool.execute(
+            self.lines, 'CUSTOM', 'Rotation', 3, self.output,
+            custom_field='bothends',
+        )
+
+        rows = self.arcpy.datasets[self.output].rows
+        self.assertEqual(
+            [(row['SOURCE_OID'], row['SOURCE_PART'], row['ENDPOINT']) for row in rows],
+            [
+                (9, 0, 'START'), (9, 0, 'END'),
+                (9, 1, 'START'), (9, 1, 'END'),
+                (10, 0, 'END'),
+            ],
+        )
+        self.assertEqual([row['BothEnds'] for row in rows], [True, True, True, True, 0])
+
+    def test_custom_accepts_case_insensitive_text_booleans(self):
+        dataset = self.arcpy.datasets[self.lines]
+        dataset.fields.append(Field('BothEnds', 'String'))
+        dataset.rows[0]['BothEnds'] = ' TrUe '
+        dataset.rows.append({
+            'oid': 10,
+            'geometry': Geometry(self.sr, parts=[[(20, 0), (30, 0)]]),
+            'RoadName': 'Second',
+            'BothEnds': 'FALSE',
+        })
+
+        self.tool.execute(
+            self.lines, 'CUSTOM', 'Rotation', 3, self.output,
+            custom_field='BothEnds',
+        )
+
+        rows = self.arcpy.datasets[self.output].rows
+        self.assertEqual(
+            [(row['SOURCE_OID'], row['ENDPOINT']) for row in rows],
+            [(9, 'START'), (9, 'END'), (9, 'START'), (9, 'END'), (10, 'END')],
+        )
+
+    def test_invalid_custom_field_or_value_preserves_existing_output(self):
+        dataset = self.arcpy.datasets[self.lines]
+        existing = Dataset(self.output, self.sr, [{'keep': True}], [], 'Point')
+        self.arcpy.datasets[self.output] = existing
+
+        with self.assertRaisesRegex(ValueError, 'is required for CUSTOM'):
+            self.tool.execute(self.lines, 'CUSTOM', 'Rotation', 3, self.output)
+        self.assertIs(self.arcpy.datasets[self.output], existing)
+
+        with self.assertRaisesRegex(ValueError, 'was not found'):
+            self.tool.execute(
+                self.lines, 'CUSTOM', 'Rotation', 3, self.output,
+                custom_field='Missing',
+            )
+        self.assertIs(self.arcpy.datasets[self.output], existing)
+
+        dataset.fields.append(Field('BothEnds', 'Double'))
+        dataset.rows[0]['BothEnds'] = 1.0
+        with self.assertRaisesRegex(ValueError, 'must be a Short, Long, Big Integer, or Text'):
+            self.tool.execute(
+                self.lines, 'CUSTOM', 'Rotation', 3, self.output,
+                custom_field='BothEnds',
+            )
+        self.assertIs(self.arcpy.datasets[self.output], existing)
+
+        dataset.fields[-1].type = 'SmallInteger'
+        for invalid_value in (None, 2, '1'):
+            dataset.rows[0]['BothEnds'] = invalid_value
+            with self.subTest(value=invalid_value):
+                with self.assertRaisesRegex(
+                    ValueError, "BothEnds.*invalid Boolean value.*Object ID 9"
+                ):
+                    self.tool.execute(
+                        self.lines, 'CUSTOM', 'Rotation', 3, self.output,
+                        custom_field='BothEnds',
+                    )
+                self.assertIs(self.arcpy.datasets[self.output], existing)
+
     def test_closed_and_degenerate_parts_are_skipped_and_partial_output_is_removed(self):
         self.arcpy.datasets[self.lines].rows[0]['geometry'] = Geometry(
             self.sr, parts=[[(0, 0), (1, 0), (0, 0)], [(2, 2), (2, 2)]]
@@ -351,7 +438,7 @@ class ArrowCreationTests(unittest.TestCase):
 
     def test_invalid_inputs_do_not_create_an_output(self):
         for placement, buffer, field, message in (
-            ('MIDDLE', 3, 'Rotation', 'START, END, or BOTH'),
+            ('MIDDLE', 3, 'Rotation', 'START, END, BOTH, or CUSTOM'),
             ('END', 'nan', 'Rotation', 'finite number'),
             ('END', 3, 'bad name', 'not valid'),
         ):

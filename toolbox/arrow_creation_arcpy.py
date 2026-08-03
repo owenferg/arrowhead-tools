@@ -5,12 +5,13 @@ arcpy adapter for creating arrowheads from line endpoints
 from __future__ import annotations
 import math
 import os
-from typing import Dict, Iterator, List, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 import arcpy
 from arrow_rotation_core import clockwise_angle_from_east, endpoints_from_part
 
 
 _NUMERIC_FIELD_TYPES = {'Double', 'Single', 'Integer', 'SmallInteger', 'BigInteger'}
+_CUSTOM_FIELD_TYPES = {'SmallInteger', 'Integer', 'BigInteger', 'String'}
 _SKIPPED_FIELD_TYPES = {'OID', 'Geometry', 'Blob', 'Raster', 'GlobalID'}
 _ADD_FIELD_TYPES = {
     'SmallInteger': 'SHORT',
@@ -91,9 +92,25 @@ def _parse_placement(value: str) -> str:
     '''validate and normalize the requested endpoint placement'''
 
     placement = str(value or '').strip().upper()
-    if placement not in {'START', 'END', 'BOTH'}:
-        raise ValueError('Arrowhead placement must be START, END, or BOTH')
+    if placement not in {'START', 'END', 'BOTH', 'CUSTOM'}:
+        raise ValueError('Arrowhead placement must be START, END, BOTH, or CUSTOM')
     return placement
+
+
+def _parse_custom_value(value) -> bool:
+    '''interpret one strict Boolean-compatible custom placement value'''
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized == 'true':
+            return True
+        if normalized == 'false':
+            return False
+    raise ValueError(f'{value!r} is not a supported Boolean value')
 
 
 def _parse_rotation_buffer(value) -> float:
@@ -168,6 +185,44 @@ def _validate_line_layer(line_layer) -> None:
         raise ValueError('Input lines must have an Object ID field')
     if any('.' in field.name for field in arcpy.ListFields(line_layer)):
         raise ValueError('Joined line layers are not supported; remove the join and run the tool again')
+
+
+def _validate_custom_field(line_layer, placement: str, custom_field) -> Optional[str]:
+    '''validate the custom placement field and all selected/input values'''
+
+    if placement != 'CUSTOM':
+        return None
+
+    requested = str(custom_field or '').strip()
+    if not requested:
+        raise ValueError('Custom placement field is required for CUSTOM placement')
+
+    field = next(
+        (
+            field
+            for field in arcpy.ListFields(line_layer)
+            if field.name.lower() == requested.lower()
+        ),
+        None,
+    )
+    if field is None:
+        raise ValueError(f'Custom placement field {requested!r} was not found in the input lines')
+    if field.type not in _CUSTOM_FIELD_TYPES:
+        raise ValueError(
+            f'Custom placement field {field.name!r} must be a Short, Long, Big Integer, '
+            'or Text field'
+        )
+
+    with arcpy.da.SearchCursor(line_layer, ['OID@', field.name]) as rows:
+        for source_oid, value in rows:
+            try:
+                _parse_custom_value(value)
+            except ValueError:
+                raise ValueError(
+                    f'Custom placement field {field.name!r} has invalid Boolean value '
+                    f'{value!r} for source Object ID {source_oid}'
+                ) from None
+    return field.name
 
 
 def _validate_rotation_field(line_layer, output: str, rotation_field: str) -> str:
@@ -291,6 +346,7 @@ def execute(
     rotation_field: str,
     rotation_buffer,
     output: str,
+    custom_field=None,
 ) -> None:
     '''create outward-facing arrowhead points from selected/input lines'''
 
@@ -299,6 +355,7 @@ def execute(
     description = arcpy.Describe(line_layer)
 
     _validate_line_layer(line_layer)
+    custom_field = _validate_custom_field(line_layer, placement, custom_field)
 
     source_spatial_reference, working_spatial_reference = _working_spatial_reference(line_layer)
     transformation = _projection_for_layer(line_layer, working_spatial_reference)
@@ -341,12 +398,31 @@ def execute(
         degenerate_count = 0
 
         read_names = ['OID@', 'SHAPE@'] + source_names
+        custom_value_index = None
+        if custom_field:
+            custom_value_index = next(
+                (
+                    index + 2
+                    for index, name in enumerate(source_names)
+                    if name.lower() == custom_field.lower()
+                ),
+                None,
+            )
+            if custom_value_index is None:
+                custom_value_index = len(read_names)
+                read_names.append(custom_field)
+
         with arcpy.da.SearchCursor(line_layer, read_names) as source_rows, arcpy.da.InsertCursor(
             output, insert_names
         ) as output_rows:
             for source_row in source_rows:
                 source_oid, geometry = source_row[:2]
-                attributes = dict(zip(output_names, source_row[2:]))
+                attributes = dict(zip(output_names, source_row[2:2 + len(source_names)]))
+                row_placement = placement
+                if custom_value_index is not None:
+                    row_placement = (
+                        'BOTH' if _parse_custom_value(source_row[custom_value_index]) else 'END'
+                    )
 
                 if geometry is None or geometry.pointCount == 0:
                     degenerate_count += 1
@@ -376,7 +452,7 @@ def execute(
 
                     endpoints = endpoints_from_part(source_oid, part_index, xy)
                     for endpoint in endpoints:
-                        if placement != 'BOTH' and endpoint.endpoint != placement:
+                        if row_placement != 'BOTH' and endpoint.endpoint != row_placement:
                             continue
 
                         point = (

@@ -1,3 +1,5 @@
+<-- ARROWHEAD TOOLS -->
+
 Keep all four Python files together when using the toolbox:
 
 - arrow_tools.pyt
@@ -20,7 +22,12 @@ Open "Create Arrowheads from Line Endpoints"
 - Lines: select the layer that contains the arrow lines. Any selection or definition
 query on the layer will be honored.
 - Arrowhead placement: creates arrowheads at the end of each line by default. This
-can be changed to the start of each line or both the start and end.
+can be changed to the start of each line, both the start and end, or CUSTOM.
+- Custom placement field: available when arrowhead placement is CUSTOM. Select a
+Short, Long, or Big Integer field containing 1/0, or a Text field containing
+true/false. True creates arrowheads at both ends of the line, while false creates an
+arrowhead at the end only. Text matching is case-insensitive and ignores surrounding
+spaces. Nulls and other values are rejected.
 - Rotation field name: the field in the new layer that will contain rotation values.
 - Rotation buffer (degrees): a buffer that adjusts each arrow by a certain amount of
 degrees. I found the default of 3 to produce best results, but can be modified at
@@ -29,7 +36,8 @@ your discretion.
 the name is your arrow line layer followed by _Arrowheads.
 
 The new layer keeps the editable fields from the lines and adds fields for the source
-line, multipart part, endpoint type, and arrowhead rotation. The script creates
+line, multipart part, endpoint type, and arrowhead rotation. For multipart lines,
+CUSTOM applies the line's placement value to every open part. The script creates
 rotation-ready data, but does not choose your arrowhead symbol. Set up your preferred
 marker in the layer's symbology and use the rotation field to rotate it.
 

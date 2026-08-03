@@ -36,12 +36,13 @@ In ArcGIS Pro, add `arrow_tools.pyt` to the Catalog pane. The toolbox includes t
 Open **Create Arrowheads from Line Endpoints** and provide the line layer. The tool accepts:
 
 - **Lines:** the lines used to create the new arrowheads. Selections and definition queries are honored.
-- **Arrowhead placement:** creates points at the end of each line by default. You can instead use the start of each line or both ends.
+- **Arrowhead placement:** creates points at the end of each line by default. You can instead use the start of each line, both ends, or a custom field that controls placement for each line.
+- **Custom placement field:** available when arrowhead placement is `CUSTOM`. True values create arrowheads at both ends of a line, while false values create an arrowhead at the end only. The field can contain Short, Long, or Big Integer `1`/`0` values, or Text `true`/`false` values; text matching is case-insensitive and ignores surrounding whitespace. Nulls and other values are rejected.
 - **Rotation field name:** the numeric field that receives the calculated rotation. The default is `Rotation`.
 - **Rotation buffer (degrees):** an offset added to each calculated rotation. The default is `+3` degrees clockwise; negative values rotate counterclockwise.
 - **Output arrowheads:** the new point feature class. The default name is the line layer name followed by `_Arrowheads`.
 
-Each output point includes the source line's editable attributes, its source Object ID and part number, whether it came from the start or end of the line, and its rotation. Multipart lines create the selected arrowheads for each open part. Closed and unusable parts are skipped.
+Each output point includes the source line's editable attributes, its source Object ID and part number, whether it came from the start or end of the line, and its rotation. Multipart lines create the selected arrowheads for each open part, using the line's custom placement value for every part when applicable. Closed and unusable parts are skipped.
 
 The output contains the data needed for field-driven marker rotation, but the tool does not choose an arrowhead symbol. In the layer's symbology properties, select your preferred marker and use the generated rotation field to control its rotation.
 

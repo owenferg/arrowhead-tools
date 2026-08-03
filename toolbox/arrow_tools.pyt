@@ -90,9 +90,9 @@ class CreateArrowheadsFromLineEndpoints:
     def __init__(self):
         self.label = "Create Arrowheads from Line Endpoints"
         self.description = (
-            "Creates new arrowhead points from line starts, ends, or both and writes "
-            "clockwise-from-east rotation values facing away from each line. No existing "
-            "arrowhead point layer is needed."
+            "Creates new arrowhead points from line starts, ends, both, or a custom "
+            "per-line field and writes clockwise-from-east rotation values facing away "
+            "from each line. No existing arrowhead point layer is needed."
         )
         self.canRunInBackground = False
         self._generated_output_default = None
@@ -116,8 +116,19 @@ class CreateArrowheadsFromLineEndpoints:
             direction="Input",
         )
         placement.filter.type = "ValueList"
-        placement.filter.list = ["START", "END", "BOTH"]
+        placement.filter.list = ["START", "END", "BOTH", "CUSTOM"]
         placement.value = "END"
+
+        custom_placement_field = arcpy.Parameter(
+            displayName="Custom placement field",
+            name="custom_placement_field",
+            datatype="Field",
+            parameterType="Optional",
+            direction="Input",
+        )
+        custom_placement_field.parameterDependencies = [lines.name]
+        custom_placement_field.filter.list = ["Short", "Long", "BigInteger", "Text"]
+        custom_placement_field.enabled = False
 
         field_name = arcpy.Parameter(
             displayName="Rotation field name",
@@ -146,15 +157,20 @@ class CreateArrowheadsFromLineEndpoints:
         )
         output.schema.geometryType = "Point"
 
-        return [lines, placement, field_name, rotation_buffer, output]
+        return [
+            lines, placement, custom_placement_field, field_name, rotation_buffer, output,
+        ]
 
     def isLicensed(self):
         return True
 
     def updateParameters(self, parameters):
+        # only show the custom field selector when custom placement is requested
+        parameters[2].enabled = parameters[1].valueAsText == "CUSTOM"
+
         # update the suggested name when the line layer changes, but keep names entered by the user
         lines = parameters[0].valueAsText
-        output = parameters[4]
+        output = parameters[5]
         if not lines:
             return
 
@@ -171,18 +187,28 @@ class CreateArrowheadsFromLineEndpoints:
         self._generated_output_default = suggested_output
 
     def updateMessages(self, parameters):
+        # custom placement requires a field from the input line layer
+        if (
+            parameters[1].valueAsText == "CUSTOM"
+            and not str(parameters[2].valueAsText or "").strip()
+        ):
+            parameters[2].setErrorMessage(
+                "Custom placement field is required for CUSTOM placement"
+            )
+
         # if the rotation field name is altered and is blank, set an error message
-        if parameters[2].altered and not str(parameters[2].valueAsText or "").strip():
-            parameters[2].setErrorMessage("Rotation field name cannot be blank")
+        if parameters[3].altered and not str(parameters[3].valueAsText or "").strip():
+            parameters[3].setErrorMessage("Rotation field name cannot be blank")
 
     def execute(self, parameters, messages):
         try:
             arrow_creation_arcpy.execute(
                 parameters[0].valueAsText, # lines
                 parameters[1].valueAsText, # arrowhead placement
-                parameters[2].valueAsText, # rotation field name
-                parameters[3].valueAsText, # rotation buffer
-                parameters[4].valueAsText, # output arrowheads
+                parameters[3].valueAsText, # rotation field name
+                parameters[4].valueAsText, # rotation buffer
+                parameters[5].valueAsText, # output arrowheads
+                custom_field=parameters[2].valueAsText,
             )
         except Exception as exc:
             arcpy.AddError(str(exc))
