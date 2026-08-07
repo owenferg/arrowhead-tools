@@ -1,11 +1,13 @@
 <-- ARROWHEAD TOOLS -->
 
-Keep all four Python files together when using the toolbox:
+Keep all six Python files together when using the toolbox:
 
 - arrow_tools.pyt
 - arrow_creation_arcpy.py
 - arrow_rotation_arcpy.py
 - arrow_rotation_core.py
+- gium_integration_arcpy.py
+- gium_integration_core.py
 
 How to use:
 
@@ -13,7 +15,8 @@ How to use:
 2. In the Catalog pane, right click Toolboxes and select Add Toolbox
 3. Navigate to the toolbox folder and select arrow_tools.pyt, hit OK
 4. The toolbox should now appear under Toolboxes. Expand arrow_tools.pyt. There are
-two tools depending on what data you have.
+three tools. The first two create or rotate arrowheads; the third creates versioned
+GIUM Atlas release datasets.
 
 For creating arrowheads when you only have lines:
 
@@ -62,7 +65,34 @@ results of executing the script. Mostly just for debugging.
 
 When parameters are set to your preference, press "Run". 
 
-To see changes for either Python script reflected in ArcGIS Pro,
+For integrating new arrows into GIUM Atlas production layers:
+
+Open "Integrate Arrow Data into GIUM Atlas Layers"
+
+- Leave both processing switches on for a normal arrow release. Turn one off only if
+  you intentionally need a line-only or point-only release.
+- Existing SeasonalArrows target: choose the complete latest seasonal-arrow line
+  shapefile (.shp), not a geodatabase feature class. The tool ignores selections
+  on this historical target so old features are not accidentally omitted.
+- New seasonal arrow lines: choose the new line layer. Selections and definition
+  queries are honored.
+- Existing GIUMPointLabels target: choose the complete latest point-label
+  shapefile (.shp), not a geodatabase feature class.
+- New arrowhead points: choose the arrowhead output made by the first tool.
+- Herd name, Country, Season, Line class, and Point type fill blank values on the new
+  features only. Values that are already present are preserved. Point type defaults
+  to "Arrowhead".
+- Release date: controls readable names such as GIUMPointLabelsMerged_June10_2026.
+- Release output folder: choose a writable folder for the new shapefiles, ZIP,
+  GeoJSON, and QA CSV. Existing releases are never overwritten.
+
+The tool validates geometry, projections, GIUM fields, metadata, rotation, and row
+counts before it publishes the dated outputs. It never changes the selected target
+or source datasets. Review the old and new layers visually in ArcGIS Pro before
+uploading anything to Mapbox. Detailed instructions and error guidance are in
+docs/gium-integration-workflow.md in the full repository.
+
+To see changes made by the first two tools reflected in ArcGIS Pro,
 go to the layer's Symbology and go to the "Vary symbol by attribute" tab.
 Pick the rotation field and set the rotation to Geographic.
 
@@ -73,4 +103,4 @@ owenf@uoregon.edu
 Visit the Github repository for more information:
 https://github.com/owenferg/arrowhead-tools
 
-Arrowhead Tools v1.3
+Arrowhead Tools v1.5

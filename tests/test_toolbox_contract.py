@@ -88,6 +88,7 @@ class ToolboxContractTests(unittest.TestCase):
             [
                 self.toolbox.CreateArrowheadsFromLineEndpoints,
                 self.toolbox.RotateArrowheads,
+                self.toolbox.IntegrateGIUMArrowData,
             ],
         )
         self.assertEqual(
@@ -97,6 +98,10 @@ class ToolboxContractTests(unittest.TestCase):
         self.assertEqual(
             self.toolbox.RotateArrowheads().label,
             "Update Existing Arrowhead Rotations",
+        )
+        self.assertEqual(
+            self.toolbox.IntegrateGIUMArrowData().label,
+            "Integrate Arrow Data into GIUM Atlas Layers",
         )
 
     def test_creation_parameter_defaults_and_execute_forwarding(self):
@@ -253,6 +258,194 @@ class ToolboxContractTests(unittest.TestCase):
             [("points", "lines", "2 Meters", "Rotation", "audit", "-4")],
         )
         self.assertEqual(parameters[6].value, "points")
+
+    def test_gium_parameter_contract_branch_enablement_and_forwarding(self):
+        tool = self.toolbox.IntegrateGIUMArrowData()
+        parameters = tool.getParameterInfo()
+        self.assertEqual(
+            [parameter.name for parameter in parameters],
+            [
+                "process_lines",
+                "line_target",
+                "new_lines",
+                "line_transformation",
+                "process_points",
+                "point_target",
+                "new_points",
+                "point_transformation",
+                "herd_name",
+                "country",
+                "season",
+                "line_class",
+                "point_type",
+                "release_date",
+                "output_folder",
+                "line_output",
+                "line_zip",
+                "point_output",
+                "point_geojson",
+                "qa_csv",
+            ],
+        )
+        self.assertIs(parameters[0].value, True)
+        self.assertIs(parameters[4].value, True)
+        self.assertEqual(parameters[1].filter.list, ["Polyline"])
+        self.assertEqual(parameters[2].filter.list, ["Polyline"])
+        self.assertEqual(parameters[5].filter.list, ["Point"])
+        self.assertEqual(parameters[6].filter.list, ["Point"])
+        self.assertEqual(parameters[12].value, "Arrowhead")
+        self.assertEqual(parameters[15].schema.geometryType, "Polyline")
+        self.assertEqual(parameters[17].schema.geometryType, "Point")
+
+        parameters[0].value = False
+        parameters[4].value = True
+        tool.updateParameters(parameters)
+        self.assertFalse(parameters[1].enabled)
+        self.assertFalse(parameters[2].enabled)
+        self.assertFalse(parameters[3].enabled)
+        self.assertTrue(parameters[9].enabled)
+        self.assertFalse(parameters[11].enabled)
+        self.assertTrue(parameters[5].enabled)
+        self.assertTrue(parameters[6].enabled)
+        self.assertTrue(parameters[12].enabled)
+
+        values = [
+            True,
+            "old_lines",
+            "new_lines",
+            "LINE_TRANSFORM",
+            True,
+            "old_points",
+            "new_points",
+            "POINT_TRANSFORM",
+            "Test Herd",
+            "Test Country",
+            "Spring migration",
+            "Migration",
+            "Arrowhead",
+            "2026-08-04",
+            "/release",
+        ]
+        for parameter, value in zip(parameters[:15], values):
+            parameter.value = value
+
+        forwarded = []
+        self.toolbox.gium_integration_arcpy.execute = lambda *args: (
+            forwarded.append(args)
+            or {
+                "line_output": "/release/lines.shp",
+                "line_zip": "/release/lines.zip",
+                "point_output": "/release/points.shp",
+                "point_geojson": "/release/points.geojson",
+                "qa_csv": "/release/qa.csv",
+            }
+        )
+        tool.execute(parameters, None)
+
+        self.assertEqual(forwarded, [tuple(values)])
+        self.assertEqual(parameters[15].value, "/release/lines.shp")
+        self.assertEqual(parameters[16].value, "/release/lines.zip")
+        self.assertEqual(parameters[17].value, "/release/points.shp")
+        self.assertEqual(parameters[18].value, "/release/points.geojson")
+        self.assertEqual(parameters[19].value, "/release/qa.csv")
+
+    def test_gium_messages_require_enabled_branch_inputs(self):
+        tool = self.toolbox.IntegrateGIUMArrowData()
+        parameters = tool.getParameterInfo()
+        parameters[14].value = str(pathlib.Path(self.temp_directory.name))
+
+        tool.updateMessages(parameters)
+
+        self.assertEqual(
+            parameters[1].error,
+            "Choose the complete latest SeasonalArrows layer.",
+        )
+        self.assertEqual(parameters[2].error, "Choose the new seasonal arrow lines.")
+        self.assertEqual(
+            parameters[5].error,
+            "Choose the complete latest GIUMPointLabels layer.",
+        )
+        self.assertEqual(
+            parameters[6].error,
+            "Choose the new arrowheads created by Part 1.",
+        )
+
+    def test_gium_messages_reject_non_shapefile_targets_before_run(self):
+        tool = self.toolbox.IntegrateGIUMArrowData()
+        parameters = tool.getParameterInfo()
+        parameters[1].value = str(self.workspace / "SeasonalArrows")
+        parameters[2].value = "new_lines"
+        parameters[5].value = str(self.workspace / "GIUMPointLabels")
+        parameters[6].value = "new_points"
+        parameters[14].value = str(pathlib.Path(self.temp_directory.name))
+
+        tool.updateMessages(parameters)
+
+        self.assertIn("production .shp file", parameters[1].error)
+        self.assertIn("production .shp file", parameters[5].error)
+
+    def test_gium_point_only_defaults_ignore_disabled_line_target(self):
+        tool = self.toolbox.IntegrateGIUMArrowData()
+        parameters = tool.getParameterInfo()
+        parameters[0].value = False
+        parameters[1].value = "/stale/line/target.shp"
+        parameters[4].value = True
+        parameters[5].value = "/current/point/target.shp"
+        captured = []
+        self.toolbox._default_release_folder = lambda line, point: (
+            captured.append((line, point)) or "/current/point"
+        )
+
+        tool.updateParameters(parameters)
+
+        self.assertEqual(captured, [(None, "/current/point/target.shp")])
+        self.assertTrue(parameters[9].enabled)
+        self.assertEqual(parameters[14].value, "/current/point")
+
+    def test_gium_generated_transformation_tracks_layer_changes(self):
+        tool = self.toolbox.IntegrateGIUMArrowData()
+        parameters = tool.getParameterInfo()
+        parameters[1].value = "old_lines"
+        parameters[2].value = "new_lines"
+        parameters[5].value = "old_points"
+        parameters[6].value = "new_points"
+        self.toolbox._available_transformations = lambda source, target: ["BEST", "OTHER"]
+
+        tool.updateParameters(parameters)
+
+        self.assertEqual(parameters[3].filter.list, ["BEST", "OTHER"])
+        self.assertEqual(parameters[3].value, "BEST")
+        parameters[3].altered = True
+        self.toolbox._available_transformations = lambda source, target: []
+
+        tool.updateParameters(parameters)
+
+        self.assertEqual(parameters[3].filter.list, [])
+        self.assertIsNone(parameters[3].value)
+        self.assertEqual(parameters[7].filter.list, [])
+        self.assertIsNone(parameters[7].value)
+
+    def test_available_transformations_uses_arcgis_recommendation_order(self):
+        source_sr = types.SimpleNamespace(name="WGS 1984", factoryCode=4326)
+        target_sr = types.SimpleNamespace(name="Web Mercator", factoryCode=3857)
+        descriptions = {
+            "source": types.SimpleNamespace(
+                spatialReference=source_sr, extent="source extent"
+            ),
+            "target": types.SimpleNamespace(
+                spatialReference=target_sr, extent="target extent"
+            ),
+        }
+        self.toolbox.arcpy.Describe = lambda value: descriptions[value]
+        calls = []
+        self.toolbox.arcpy.ListTransformations = lambda source, target, extent: (
+            calls.append((source, target, extent)) or ["BEST", "SECOND"]
+        )
+
+        available = self.toolbox._available_transformations("source", "target")
+
+        self.assertEqual(available, ["BEST", "SECOND"])
+        self.assertEqual(calls, [(source_sr, target_sr, "source extent")])
 
 
 if __name__ == "__main__":

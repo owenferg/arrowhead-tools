@@ -4,16 +4,21 @@ created by Owen Ferguson
 '''
 
 import importlib
+import datetime
 import os
 import arcpy
 import arrow_rotation_core
 import arrow_creation_arcpy
 import arrow_rotation_arcpy
+import gium_integration_core
+import gium_integration_arcpy
 
 # reload the scripts when the toolbox is refreshed so ArcGIS does not use older cached versions
 arrow_rotation_core = importlib.reload(arrow_rotation_core)
 arrow_creation_arcpy = importlib.reload(arrow_creation_arcpy)
 arrow_rotation_arcpy = importlib.reload(arrow_rotation_arcpy)
+gium_integration_core = importlib.reload(gium_integration_core)
+gium_integration_arcpy = importlib.reload(gium_integration_arcpy)
 
 
 def _input_name_and_workspace(lines):
@@ -79,11 +84,72 @@ def _default_output_path(lines):
         output_name += ".shp"
     return os.path.join(workspace, output_name)
 
+
+def _default_release_folder(*datasets):
+    '''suggest a normal folder beside the first selected production dataset'''
+
+    for dataset in datasets:
+        if not dataset:
+            continue
+        try:
+            description = arcpy.Describe(dataset)
+            path = getattr(description, "path", None)
+            catalog_path = getattr(description, "catalogPath", None) or str(dataset)
+            candidate = path or os.path.dirname(catalog_path)
+            if str(candidate).lower().endswith((".gdb", ".sde")):
+                candidate = os.path.dirname(candidate)
+            if candidate and os.path.isdir(candidate) and os.access(candidate, os.W_OK):
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _available_transformations(source_layer, target_layer):
+    '''return ArcGIS Pro's recommended datum transformations in preferred order'''
+
+    if not source_layer or not target_layer:
+        return []
+    try:
+        source_description = arcpy.Describe(source_layer)
+        target_description = arcpy.Describe(target_layer)
+        source_sr = source_description.spatialReference
+        target_sr = target_description.spatialReference
+        if not source_sr or not target_sr or source_sr.name == "Unknown" or target_sr.name == "Unknown":
+            return []
+        if (
+            source_sr.factoryCode and target_sr.factoryCode
+            and source_sr.factoryCode == target_sr.factoryCode
+        ):
+            return []
+        return list(arcpy.ListTransformations(
+            source_sr, target_sr, source_description.extent
+        ) or [])
+    except Exception:
+        return []
+
+
+def _is_shapefile_layer(layer):
+    '''check whether a selected production target resolves to a shapefile'''
+
+    if not layer:
+        return False
+    try:
+        description = arcpy.Describe(layer)
+        catalog_path = getattr(description, "catalogPath", None) or str(layer)
+        return os.path.splitext(str(catalog_path))[1].lower() == ".shp"
+    except Exception:
+        return False
+
 class Toolbox:
     def __init__(self):
         self.label = "Arrow Tools"
         self.alias = "arrows"
-        self.tools = [CreateArrowheadsFromLineEndpoints, RotateArrowheads]
+        self.tools = [
+            CreateArrowheadsFromLineEndpoints,
+            RotateArrowheads,
+            IntegrateGIUMArrowData,
+        ]
 
 
 class CreateArrowheadsFromLineEndpoints:
@@ -311,6 +377,415 @@ class RotateArrowheads:
             )
             parameters[6].value = parameters[0].value # updated arrowhead layer
         
+        except Exception as exc:
+            arcpy.AddError(str(exc))
+            raise
+
+
+class IntegrateGIUMArrowData:
+    '''GIUM release workflow for seasonal lines and point-label arrowheads'''
+
+    def __init__(self):
+        self.label = "Integrate Arrow Data into GIUM Atlas Layers"
+        self.description = (
+            "Creates safe, dated copies of the GIUM SeasonalArrows and GIUMPointLabels "
+            "datasets, projects and appends only the new features, fills missing GIUM "
+            "metadata, validates the release, and creates the Mapbox-ready ZIP and "
+            "GeoJSON packages. Existing production datasets are never changed."
+        )
+        self.canRunInBackground = False
+        self._generated_output_folder = None
+        self._generated_line_transformation = None
+        self._generated_point_transformation = None
+
+    @staticmethod
+    def _parameter(
+        display_name, name, datatype, parameter_type, direction, category
+    ):
+        parameter = arcpy.Parameter(
+            displayName=display_name,
+            name=name,
+            datatype=datatype,
+            parameterType=parameter_type,
+            direction=direction,
+        )
+        parameter.category = category
+        return parameter
+
+    def getParameterInfo(self):
+        process_lines = self._parameter(
+            "Process seasonal arrow lines",
+            "process_lines",
+            "GPBoolean",
+            "Required",
+            "Input",
+            "1. Seasonal arrow lines",
+        )
+        process_lines.value = True
+
+        line_target = self._parameter(
+            "Existing SeasonalArrows production shapefile (.shp; complete latest)",
+            "line_target",
+            "GPFeatureLayer",
+            "Optional",
+            "Input",
+            "1. Seasonal arrow lines",
+        )
+        line_target.filter.list = ["Polyline"]
+
+        new_lines = self._parameter(
+            "New seasonal arrow lines",
+            "new_lines",
+            "GPFeatureLayer",
+            "Optional",
+            "Input",
+            "1. Seasonal arrow lines",
+        )
+        new_lines.filter.list = ["Polyline"]
+
+        line_transformation = self._parameter(
+            "Line geographic transformation",
+            "line_transformation",
+            "GPString",
+            "Optional",
+            "Input",
+            "1. Seasonal arrow lines",
+        )
+        line_transformation.filter.type = "ValueList"
+
+        process_points = self._parameter(
+            "Process arrowhead points",
+            "process_points",
+            "GPBoolean",
+            "Required",
+            "Input",
+            "2. Arrowhead points",
+        )
+        process_points.value = True
+
+        point_target = self._parameter(
+            "Existing GIUMPointLabels production shapefile (.shp; complete latest)",
+            "point_target",
+            "GPFeatureLayer",
+            "Optional",
+            "Input",
+            "2. Arrowhead points",
+        )
+        point_target.filter.list = ["Point"]
+
+        new_points = self._parameter(
+            "New arrowhead points from Part 1",
+            "new_points",
+            "GPFeatureLayer",
+            "Optional",
+            "Input",
+            "2. Arrowhead points",
+        )
+        new_points.filter.list = ["Point"]
+
+        point_transformation = self._parameter(
+            "Point geographic transformation",
+            "point_transformation",
+            "GPString",
+            "Optional",
+            "Input",
+            "2. Arrowhead points",
+        )
+        point_transformation.filter.type = "ValueList"
+
+        herd_name = self._parameter(
+            "Herd name (fills blanks only)",
+            "herd_name",
+            "GPString",
+            "Optional",
+            "Input",
+            "3. GIUM metadata",
+        )
+        country = self._parameter(
+            "Country (fills blanks when the target has Country)",
+            "country",
+            "GPString",
+            "Optional",
+            "Input",
+            "3. GIUM metadata",
+        )
+        season = self._parameter(
+            "Season (fills blanks only)",
+            "season",
+            "GPString",
+            "Optional",
+            "Input",
+            "3. GIUM metadata",
+        )
+        line_class = self._parameter(
+            "Line class (fills blanks only)",
+            "line_class",
+            "GPString",
+            "Optional",
+            "Input",
+            "3. GIUM metadata",
+        )
+        point_type = self._parameter(
+            "Point type (fills blanks only)",
+            "point_type",
+            "GPString",
+            "Required",
+            "Input",
+            "3. GIUM metadata",
+        )
+        point_type.value = "Arrowhead"
+
+        release_date = self._parameter(
+            "Release date",
+            "release_date",
+            "GPDate",
+            "Required",
+            "Input",
+            "4. Release outputs",
+        )
+        release_date.value = datetime.datetime.now()
+
+        output_folder = self._parameter(
+            "Release output folder",
+            "output_folder",
+            "DEFolder",
+            "Required",
+            "Input",
+            "4. Release outputs",
+        )
+
+        line_output = self._parameter(
+            "New SeasonalArrows shapefile",
+            "line_output",
+            "DEFeatureClass",
+            "Derived",
+            "Output",
+            "5. Created release",
+        )
+        line_output.schema.geometryType = "Polyline"
+        line_zip = self._parameter(
+            "SeasonalArrows ZIP",
+            "line_zip",
+            "DEFile",
+            "Derived",
+            "Output",
+            "5. Created release",
+        )
+        point_output = self._parameter(
+            "New GIUMPointLabels shapefile",
+            "point_output",
+            "DEFeatureClass",
+            "Derived",
+            "Output",
+            "5. Created release",
+        )
+        point_output.schema.geometryType = "Point"
+        point_geojson = self._parameter(
+            "GIUMPointLabels GeoJSON",
+            "point_geojson",
+            "DEFile",
+            "Derived",
+            "Output",
+            "5. Created release",
+        )
+        qa_csv = self._parameter(
+            "GIUM release QA report",
+            "qa_csv",
+            "DEFile",
+            "Derived",
+            "Output",
+            "5. Created release",
+        )
+
+        return [
+            process_lines,
+            line_target,
+            new_lines,
+            line_transformation,
+            process_points,
+            point_target,
+            new_points,
+            point_transformation,
+            herd_name,
+            country,
+            season,
+            line_class,
+            point_type,
+            release_date,
+            output_folder,
+            line_output,
+            line_zip,
+            point_output,
+            point_geojson,
+            qa_csv,
+        ]
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        process_lines = parameters[0].value is not False
+        process_points = parameters[4].value is not False
+
+        # keep inputs for disabled branches out of the users way
+        for index in (1, 2, 3):
+            parameters[index].enabled = process_lines
+        for index in (5, 6, 7):
+            parameters[index].enabled = process_points
+
+        parameters[9].enabled = process_lines or process_points
+        parameters[11].enabled = process_lines
+        parameters[12].enabled = process_points
+
+        # refresh the recommended line transformation when either line layer changes
+        line_transformations = (
+            _available_transformations(
+                parameters[2].valueAsText, parameters[1].valueAsText
+            )
+            if process_lines
+            else []
+        )
+        parameters[3].filter.list = line_transformations
+        current_line_transformation = parameters[3].valueAsText
+        if (
+            current_line_transformation
+            and current_line_transformation not in line_transformations
+        ):
+            parameters[3].value = None
+            current_line_transformation = None
+            self._generated_line_transformation = None
+        if line_transformations and (
+            not parameters[3].altered
+            or not current_line_transformation
+            or current_line_transformation == self._generated_line_transformation
+        ):
+            parameters[3].value = line_transformations[0]
+            self._generated_line_transformation = line_transformations[0]
+        elif (
+            not line_transformations
+            and current_line_transformation == self._generated_line_transformation
+        ):
+            parameters[3].value = None
+            self._generated_line_transformation = None
+
+        # do the same transformation check for the arrowhead point layers
+        point_transformations = (
+            _available_transformations(
+                parameters[6].valueAsText, parameters[5].valueAsText
+            )
+            if process_points
+            else []
+        )
+        parameters[7].filter.list = point_transformations
+        current_point_transformation = parameters[7].valueAsText
+        if (
+            current_point_transformation
+            and current_point_transformation not in point_transformations
+        ):
+            parameters[7].value = None
+            current_point_transformation = None
+            self._generated_point_transformation = None
+        if point_transformations and (
+            not parameters[7].altered
+            or not current_point_transformation
+            or current_point_transformation == self._generated_point_transformation
+        ):
+            parameters[7].value = point_transformations[0]
+            self._generated_point_transformation = point_transformations[0]
+        elif (
+            not point_transformations
+            and current_point_transformation == self._generated_point_transformation
+        ):
+            parameters[7].value = None
+            self._generated_point_transformation = None
+
+        output = parameters[14]
+        # suggest a nearby release folder until the user enters their own folder
+        if not output.altered or output.valueAsText == self._generated_output_folder:
+            suggestion = _default_release_folder(
+                parameters[1].valueAsText if process_lines else None,
+                parameters[5].valueAsText if process_points else None,
+            )
+            if suggestion:
+                output.value = suggestion
+                self._generated_output_folder = suggestion
+
+    def updateMessages(self, parameters):
+        process_lines = parameters[0].value is not False
+        process_points = parameters[4].value is not False
+
+        # show input problems in the tool form before the user presses Run
+        if not process_lines and not process_points:
+            parameters[0].setErrorMessage(
+                "Select at least one branch: seasonal arrow lines or arrowhead points."
+            )
+        if process_lines:
+            if not parameters[1].valueAsText:
+                parameters[1].setErrorMessage(
+                    "Choose the complete latest SeasonalArrows layer."
+                )
+            elif not _is_shapefile_layer(parameters[1].valueAsText):
+                parameters[1].setErrorMessage(
+                    "The SeasonalArrows target must be the complete production .shp file, "
+                    "not a geodatabase feature class."
+                )
+            if not parameters[2].valueAsText:
+                parameters[2].setErrorMessage("Choose the new seasonal arrow lines.")
+        if process_points:
+            if not parameters[5].valueAsText:
+                parameters[5].setErrorMessage(
+                    "Choose the complete latest GIUMPointLabels layer."
+                )
+            elif not _is_shapefile_layer(parameters[5].valueAsText):
+                parameters[5].setErrorMessage(
+                    "The GIUMPointLabels target must be the complete production .shp file, "
+                    "not a geodatabase feature class."
+                )
+            if not parameters[6].valueAsText:
+                parameters[6].setErrorMessage(
+                    "Choose the new arrowheads created by Part 1."
+                )
+            if not str(parameters[12].valueAsText or "").strip():
+                parameters[12].setErrorMessage("Point type cannot be blank.")
+        if not parameters[13].value:
+            parameters[13].setErrorMessage("Choose a release date.")
+        if not parameters[14].valueAsText:
+            parameters[14].setErrorMessage("Choose a release output folder.")
+
+    @staticmethod
+    def _result_value(result, name):
+        if isinstance(result, dict):
+            return result.get(name)
+        return getattr(result, name, None)
+
+    def execute(self, parameters, messages):
+        try:
+            # pass the ArcGIS form values to the integration adapter
+            result = gium_integration_arcpy.execute(
+                parameters[0].value,
+                parameters[1].valueAsText,
+                parameters[2].valueAsText,
+                parameters[3].valueAsText,
+                parameters[4].value,
+                parameters[5].valueAsText,
+                parameters[6].valueAsText,
+                parameters[7].valueAsText,
+                parameters[8].valueAsText,
+                parameters[9].valueAsText,
+                parameters[10].valueAsText,
+                parameters[11].valueAsText,
+                parameters[12].valueAsText,
+                parameters[13].value,
+                parameters[14].valueAsText,
+            )
+            # send created paths back to ArcGIS as derived outputs
+            for index, name in zip(
+                (15, 16, 17, 18, 19),
+                ("line_output", "line_zip", "point_output", "point_geojson", "qa_csv"),
+            ):
+                value = self._result_value(result, name)
+                if value:
+                    parameters[index].value = value
         except Exception as exc:
             arcpy.AddError(str(exc))
             raise

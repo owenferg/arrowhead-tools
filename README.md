@@ -7,11 +7,11 @@ An ArcGIS Pro Python toolbox that creates arrowhead points from line endpoints o
 [Download the latest ArcGIS Pro toolbox](https://github.com/owenferg/arrowhead-tools/releases/latest/)
 
 Extract the ZIP, then add `arrow_tools.pyt` to the ArcGIS Pro Catalog pane.
-Keep all four extracted Python files in the same folder.
+Keep all six extracted Python files in the same folder.
 
 ## Requirements
 
-- ArcGIS Pro with ArcPy
+- ArcGIS Pro 3.3 or newer with ArcPy (Basic license or higher)
 - Arrowhead points and lines with defined spatial references
 - An editable arrowhead point layer with an Object ID field
 
@@ -19,17 +19,20 @@ No third-party Python packages are required.
 
 ## Install
 
-Keep the four Python files in `toolbox/` together:
+Keep the six Python files in `toolbox/` together:
 
 - `arrow_tools.pyt`
 - `arrow_creation_arcpy.py`
 - `arrow_rotation_arcpy.py`
 - `arrow_rotation_core.py`
+- `gium_integration_arcpy.py`
+- `gium_integration_core.py`
 
-In ArcGIS Pro, add `arrow_tools.pyt` to the Catalog pane. The toolbox includes two tools:
+In ArcGIS Pro, add `arrow_tools.pyt` to the Catalog pane. The toolbox includes three tools:
 
 - **Create Arrowheads from Line Endpoints** creates a new arrowhead point layer when you only have lines.
 - **Update Existing Arrowhead Rotations** updates arrowhead points that already exist.
+- **Integrate Arrow Data into GIUM Atlas Layers** creates safe, dated GIUM line and point-label releases from new lines and Part 1 arrowheads.
 
 ## Create arrowheads when you only have lines
 
@@ -65,6 +68,19 @@ An existing audit table is replaced only when ArcGIS Pro's **Overwrite outputs**
 
 For layers in a geographic coordinate system, the tool performs distance and direction calculations in WGS 1984 Web Mercator Auxiliary Sphere and reports a warning.
 
+## Integrate new arrows into the GIUM Atlas datasets
+
+The third tool is specific to the Global Initiative on Ungulate Migration workflow. It can update either or both of the two GIUM production datasets involved in an arrow release:
+
+- the latest complete `SeasonalArrows` line shapefile; and
+- the latest complete `GIUMPointLabels` point shapefile, which stores arrowheads alongside other point labels.
+
+The tool never edits those targets. It creates new dated shapefiles named like `SeasonalArrowsMerged_June10_2026` and `GIUMPointLabelsMerged_June10_2026`, explicitly projects selected new features to the corresponding target coordinate system, maps the known GIUM fields, fills only missing metadata, and verifies that historical and new feature counts are preserved. It also creates a zipped seasonal-arrow shapefile, a formatted WGS 84 point-label GeoJSON file, and a CSV QA report.
+
+Both branches are enabled by default but can be run independently. New-input selections and definition queries are honored; selections on historical targets are intentionally ignored so an incomplete production release cannot be created accidentally. Existing dated releases are never overwritten.
+
+The tool stops at checked GIS deliverables. Mapbox uploads, style-source changes, spreadsheet edits, and archival remain manual. See [the GIUM integration workflow](docs/gium-integration-workflow.md) for the operator procedure, field rules, outputs, review checklist, and troubleshooting guidance.
+
 ## Test
 
 Run the tests that do not require ArcGIS Pro:
@@ -79,7 +95,7 @@ Run the ArcGIS smoke test from the ArcGIS Pro Python window or an authorized Pyt
 exec(open(r"C:\path\to\arrowhead-tools\tests\arcgis_pro_smoke_test.py").read())
 ```
 
-The smoke test creates a temporary geodatabase, runs the toolbox logic, checks the buffered rotations and audit statuses, and removes the temporary data.
+The smoke test creates disposable geodatabase and shapefile data, exercises all three tools, and checks selections, complete-history preservation, projection coordinates, field precedence, packaging, rollback, buffered rotations, and audit outputs before removing the temporary data.
 
 ## License
 
