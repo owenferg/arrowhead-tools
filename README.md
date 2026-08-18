@@ -79,8 +79,6 @@ The tool never edits those targets. It creates new dated shapefiles named like `
 
 Both branches are enabled by default but can be run independently. New-input selections and definition queries are honored; selections on historical targets are intentionally ignored so an incomplete production release cannot be created accidentally. Existing dated releases are never overwritten.
 
-The tool stops at checked GIS deliverables. Mapbox uploads, style-source changes, spreadsheet edits, and archival remain manual. See [the GIUM integration workflow](docs/gium-integration-workflow.md) for the operator procedure, field rules, outputs, review checklist, and troubleshooting guidance.
-
 ## Test
 
 Run the tests that do not require ArcGIS Pro:
@@ -96,7 +94,3 @@ exec(open(r"C:\path\to\arrowhead-tools\tests\arcgis_pro_smoke_test.py").read())
 ```
 
 The smoke test creates disposable geodatabase and shapefile data, exercises all three tools, and checks selections, complete-history preservation, projection coordinates, field precedence, packaging, rollback, buffered rotations, and audit outputs before removing the temporary data.
-
-## License
-
-Released under the [MIT License](LICENSE).

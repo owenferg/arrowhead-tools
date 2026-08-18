@@ -174,8 +174,7 @@ def _choose_transformation(
     if _gcs_code(source_sr) != _gcs_code(target_sr):
         raise ValueError(
             f'ArcGIS could not find a geographic transformation for {label.lower()}. '
-            'Ask the GIS data manager to confirm the input coordinate system and install '
-            'any required ArcGIS coordinate-system data.'
+            'Confirm the input coordinate system and install any required ArcGIS coordinate-system data.'
         )
     return ''
 
