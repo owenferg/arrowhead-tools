@@ -328,7 +328,7 @@ class GiumIntegrationArcPyTests(unittest.TestCase):
             row['check'] == 'rotation_minimum' and row['value'] == '32.0'
             for row in rows
         ))
-        self.assertTrue(any('visual review' in warning for warning in self.arcpy.warnings))
+        self.assertTrue(any('visual review' in message for message in self.arcpy.messages))
 
     def test_text_false_disables_branch(self):
         result = self.run_tool(process_lines='false', line_target=None, new_lines=None)

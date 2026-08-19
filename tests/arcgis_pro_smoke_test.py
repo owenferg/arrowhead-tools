@@ -422,7 +422,7 @@ def run() -> None:
                 points, ["rotation_deg"], sql_clause=(None, "ORDER BY OBJECTID")
             )
         ]
-        assert rotations == [3.0, 183.0, 77.0], rotations
+        assert rotations == [0.0, 180.0, 77.0], rotations
         statuses = sorted(
             status for (status,) in arcpy.da.SearchCursor(audit, ["STATUS"])
         )

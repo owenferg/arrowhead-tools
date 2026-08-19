@@ -33,9 +33,9 @@ arrowhead at the end only. Text matching is case-insensitive and ignores surroun
 spaces. Nulls and other values are rejected.
 - Rotation field name: the field in the new layer that will contain rotation values.
 Default is "Rotation"; update this field if you would prefer a different field name.
-- Rotation buffer (degrees): a buffer that adjusts each arrow by a certain amount of
-degrees. I found the default of 3 to produce best results, but change to 0 if you think
-the arrowheads are off (or any other integer).
+- Clockwise rotation buffer (degrees): a buffer that adjusts each arrow by a certain amount of
+degrees. The default of 0 is recommended; change it only if your arrowheads look
+consistently off, in which case any positive or negative integer works.
 - Output arrowheads: location and name for the new arrowhead point layer. By default,
 the name is your arrow line layer followed by _Arrowheads.
 
@@ -51,15 +51,16 @@ Open "Update Existing Arrowhead Rotations"
 
 - Arrowhead points: select your layer that contains the arrowhead points.
 - Lines: select your layer that contains the arrow's lines.
-- Maximum endpoint distance: determines how far the script searches for an endpoint 
-of a line from the arrowhead point. I recommend not changing this unless you have points
-that are not directly on the start or ending points of your lines.
-- Rotation field: the field from your arrowhead points layer that determines rotation 
-values. Choose from the dropdown if the default "Rotation" isn't accurate (ArcGIS Pro
-will give you a warning if this is the case).
-- Rotation buffer (degrees): a buffer that adjusts each arrow by a certain amount of
-degrees. I found the default of 3 to produce best results, but change to 0 if you think
-the arrowheads are off (or any other integer).
+- Maximum endpoint match distance: determines how far the script searches for an
+endpoint of a line from the arrowhead point. The default is 5 Meters. I recommend not
+changing this unless you have points that are not directly on the start or ending
+points of your lines.
+- Rotation field name: the field from your arrowhead points layer that determines
+rotation values. Choose from the dropdown if the default "Rotation" isn't accurate
+(ArcGIS Pro will give you a warning if this is the case).
+- Clockwise rotation buffer (degrees): a buffer that adjusts each arrow by a certain amount of
+degrees. The default of 0 is recommended; change it only if your arrowheads look
+consistently off, in which case any positive or negative integer works.
 - Audit output table: Optional; creates a table that contains information about the
 results of executing the script. Mostly just for debugging.
 
@@ -67,7 +68,7 @@ When parameters are set to your preference, press "Run".
 
 For integrating new arrows into GIUM Atlas production layers:
 
-Open "Integrate Arrow Data into GIUM Atlas Layers"
+Open "Integrate Data into Existing GIUM Layers"
 
 - Leave both processing switches on for a normal arrow release. Turn one off only if
   you intentionally need a line-only or point-only release.
@@ -91,8 +92,11 @@ Open "Integrate Arrow Data into GIUM Atlas Layers"
 - Point geographic transformation: Optional; works exactly like the line version
   above, but for the two point layers.
 - Herd name, Country, Season, Line class, and Point type fill blank values on the new
-  features only. Values that are already present are preserved. Point type defaults
-  to "Arrowhead".
+  features only. Values that are already present are preserved. Line class defaults to
+  "Seasonal Movement" and Point type defaults to "Arrowhead". Herd name, Country,
+  Season, and Line class are required for lines; if the new data leaves any of them
+  blank and you enter nothing, the tool stops before it copies anything and lists
+  every value it still needs.
 - Release date: controls readable names such as GIUMPointLabelsMerged_June10_2026.
 - Release output folder: choose a writable folder for the new shapefiles, ZIP,
   GeoJSON, and QA CSV. Existing releases are never overwritten.
@@ -100,8 +104,7 @@ Open "Integrate Arrow Data into GIUM Atlas Layers"
 The tool validates geometry, projections, GIUM fields, metadata, rotation, and row
 counts before it publishes the dated outputs. It never changes the selected target
 or source datasets. Review the old and new layers visually in ArcGIS Pro before
-uploading anything to Mapbox. Detailed instructions and error guidance are in
-docs/gium-integration-workflow.md in the full repository.
+uploading anything to Mapbox.
 
 To see changes made by the first two tools reflected in ArcGIS Pro,
 go to the layer's Symbology and go to the "Vary symbol by attribute" tab.

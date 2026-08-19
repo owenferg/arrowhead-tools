@@ -212,7 +212,7 @@ class CreateArrowheadsFromLineEndpoints:
             parameterType="Required",
             direction="Input",
         )
-        rotation_buffer.value = 3
+        rotation_buffer.value = 0
 
         output = arcpy.Parameter(
             displayName="Output arrowheads",
@@ -336,7 +336,7 @@ class RotateArrowheads:
             parameterType="Required",
             direction="Input",
         )
-        rotation_buffer.value = 3
+        rotation_buffer.value = 0
 
         audit = arcpy.Parameter(
             displayName="Audit output table",
@@ -386,7 +386,7 @@ class IntegrateGIUMArrowData:
     '''GIUM release workflow for seasonal lines and point-label arrowheads'''
 
     def __init__(self):
-        self.label = "Integrate Arrow Data into GIUM Atlas Layers"
+        self.label = "Integrate Data into Existing GIUM Layers"
         self.description = (
             "Creates safe, dated copies of the GIUM SeasonalArrows and GIUMPointLabels "
             "datasets, projects and appends only the new features, fills missing GIUM "
@@ -525,6 +525,8 @@ class IntegrateGIUMArrowData:
             "Input",
             "3. GIUM metadata",
         )
+        line_class.value = "Seasonal Movement"
+
         point_type = self._parameter(
             "Point type (fills blanks only)",
             "point_type",

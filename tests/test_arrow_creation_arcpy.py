@@ -133,9 +133,37 @@ def _field_value(row, field):
     return row.get(field)
 
 
+class DatasetRegistry(dict):
+    '''index datasets by normalized path, the way ArcGIS treats catalog paths
+
+    the tools build output paths with os.path.join, so a workspace written with
+    forward slashes comes back with a backslash on Windows and would otherwise
+    miss the key the test registered.
+    '''
+
+    @staticmethod
+    def _key(path):
+        return os.path.normcase(os.path.normpath(str(path)))
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._key(key))
+
+    def __setitem__(self, key, value):
+        super().__setitem__(self._key(key), value)
+
+    def __contains__(self, key):
+        return super().__contains__(self._key(key))
+
+    def get(self, key, default=None):
+        return super().get(self._key(key), default)
+
+    def pop(self, key, *default):
+        return super().pop(self._key(key), *default)
+
+
 def build_fake_arcpy():
     module = types.ModuleType('arcpy')
-    module.datasets = {}
+    module.datasets = DatasetRegistry()
     module.messages = []
     module.warnings = []
     module.env = types.SimpleNamespace(overwriteOutput=True)

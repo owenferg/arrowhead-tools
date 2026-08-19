@@ -2,6 +2,7 @@ import csv
 import datetime
 import io
 import math
+import os
 import pathlib
 import sys
 import unittest
@@ -226,11 +227,12 @@ class ReleaseArtifactTests(unittest.TestCase):
     def test_paths_join_to_selected_folder(self):
         paths = release_artifact_paths("/release folder", "20260409")
         self.assertEqual(
-            paths["line_zip"], "/release folder/SeasonalArrowsMerged_April9_2026.zip"
+            paths["line_zip"],
+            os.path.join("/release folder", "SeasonalArrowsMerged_April9_2026.zip"),
         )
         self.assertEqual(
             paths["point_geojson"],
-            "/release folder/GIUMPointLabelsMerged_April9_2026.geojson",
+            os.path.join("/release folder", "GIUMPointLabelsMerged_April9_2026.geojson"),
         )
         with self.assertRaisesRegex(ValueError, "Output folder"):
             release_artifact_paths(" ", "20260409")

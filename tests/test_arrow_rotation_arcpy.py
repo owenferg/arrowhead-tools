@@ -202,13 +202,13 @@ class ArrowToolTests(unittest.TestCase):
         audit = r"C:\test.gdb\arrow_audit"
         self.tool.execute("points", "lines", "2 Meters", "rotation_deg", audit)
 
-        self.assertEqual(self.point_rows[0]["rotation_deg"], 3)
-        self.assertEqual(self.point_rows[1]["rotation_deg"], 183)
+        self.assertEqual(self.point_rows[0]["rotation_deg"], 0)
+        self.assertEqual(self.point_rows[1]["rotation_deg"], 180)
         self.assertEqual(self.point_rows[2]["rotation_deg"], 77)
         statuses = [row["STATUS"] for row in self.arcpy.datasets[audit].rows]
         self.assertEqual(statuses, ["MATCHED", "MATCHED", "UNMATCHED"])
         rotations = [row["ROTATION"] for row in self.arcpy.datasets[audit].rows]
-        self.assertEqual(rotations, [3, 183, None])
+        self.assertEqual(rotations, [0, 180, None])
         self.assertTrue(any("Updated 2" in message for message in self.arcpy.messages))
 
     def test_existing_audit_is_preserved_when_overwrite_is_disabled(self):
@@ -238,7 +238,7 @@ class ArrowToolTests(unittest.TestCase):
         for row in self.point_rows:
             row.pop("rotation_deg")
         self.tool.execute("points", "lines", "2 Meters", "new_angle", None)
-        self.assertEqual(self.point_rows[0]["new_angle"], 3)
+        self.assertEqual(self.point_rows[0]["new_angle"], 0)
         self.assertEqual(self.point_rows[2]["new_angle"], None)
 
     def test_rotation_buffer_is_modifiable_and_wraps(self):

@@ -279,7 +279,7 @@ def execute(
     tolerance_text: str,
     field_name: str,
     audit_table: Optional[str],
-    rotation_buffer_text: str = "3",
+    rotation_buffer_text: str = "0",
 ) -> None:
     '''calculate and persist rotations for all selected/input arrowhead points'''
 

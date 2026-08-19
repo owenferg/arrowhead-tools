@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 import zipfile
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -528,11 +529,75 @@ def _null_geometry_count(dataset) -> int:
     return count
 
 
-def _invalid_geometry_count(dataset, output_table: str) -> int:
-    '''count ArcGIS geometry problems, including nonempty invalid geometry'''
+def _remove_staging_root(staging_root: str) -> None:
+    '''delete the temporary staging folder, waiting for ArcGIS to drop its locks
+
+    ArcGIS releases file geodatabase locks a moment after the last tool finishes,
+    and over a network share that lag is long enough that a single attempt leaves
+    a hidden staging folder behind on every run.
+    '''
+
+    for attempt in range(5):
+        try:
+            shutil.rmtree(staging_root)
+            return
+        except OSError as cleanup_error:
+            last_error = cleanup_error
+            time.sleep(0.5 * (attempt + 1))
+    arcpy.AddWarning(
+        f'Could not remove temporary staging folder {staging_root}: {last_error}. '
+        'It holds no release data and can be deleted by hand.'
+    )
+
+
+def _geometry_problems(dataset, output_table: str) -> Tuple[int, str]:
+    '''count real geometry defects and describe them
+
+    CheckGeometry also reports dataset-level conditions with a feature id of -1,
+    such as the missing spatial index on a freshly copied staging shapefile.
+    Those are not geometry defects and must not block a release.
+    '''
 
     arcpy.management.CheckGeometry(dataset, output_table, 'ESRI')
-    return _count(output_table)
+    total = _count(output_table)
+    if not total:
+        return 0, ''
+    try:
+        names = {field.name.upper() for field in arcpy.ListFields(output_table)}
+    except Exception:
+        names = set()
+    wanted = [name for name in ('FEATURE_ID', 'PROBLEM') if name in names]
+    if 'FEATURE_ID' not in wanted:
+        return total, ''
+
+    defects = []
+    with arcpy.da.SearchCursor(output_table, wanted) as rows:
+        for row in rows:
+            values = dict(zip(wanted, row))
+            feature_id = values.get('FEATURE_ID')
+            try:
+                dataset_level = int(feature_id) < 0
+            except (TypeError, ValueError):
+                dataset_level = False
+            if dataset_level:
+                continue
+            defects.append('feature %s: %s' % (
+                feature_id, values.get('PROBLEM', 'unspecified problem')
+            ))
+    return len(defects), '; '.join(defects[:10])
+
+
+def _field_properties(field) -> Dict[str, object]:
+    '''describe the field properties a packaged release has to preserve'''
+
+    properties: Dict[str, object] = {'type': field.type}
+    if field.type == 'String':
+        properties['length'] = getattr(field, 'length', None)
+    elif field.type in _NUMERIC_FIELD_TYPES:
+        properties['precision'] = getattr(field, 'precision', None)
+        properties['scale'] = getattr(field, 'scale', None)
+    properties['nullable'] = getattr(field, 'isNullable', None)
+    return properties
 
 
 def _schema_signature(dataset):
@@ -542,17 +607,42 @@ def _schema_signature(dataset):
     for field in arcpy.ListFields(dataset):
         if field.type in _SYSTEM_FIELD_TYPES or getattr(field, 'required', False):
             continue
-        item = [field.name.casefold(), field.type]
-        if field.type == 'String':
-            item.append(getattr(field, 'length', None))
-        elif field.type in _NUMERIC_FIELD_TYPES:
-            item.extend([
-                getattr(field, 'precision', None),
-                getattr(field, 'scale', None),
-            ])
-        item.append(getattr(field, 'isNullable', None))
-        signature.append(tuple(item))
+        signature.append((field.name.casefold(), _field_properties(field)))
     return signature
+
+
+def _schema_differences(target_schema, release_schema) -> List[str]:
+    '''explain exactly how a packaged schema drifted from its production target'''
+
+    target_names = [name for name, _ in target_schema]
+    release_names = [name for name, _ in release_schema]
+    differences = []
+
+    missing = [name for name in target_names if name not in release_names]
+    if missing:
+        differences.append('missing field(s) ' + ', '.join(missing))
+    added = [name for name in release_names if name not in target_names]
+    if added:
+        differences.append('unexpected field(s) ' + ', '.join(added))
+
+    shared = [name for name in target_names if name in release_names]
+    release_order = [name for name in release_names if name in shared]
+    if release_order != shared:
+        differences.append(
+            'field order changed from %s to %s'
+            % (', '.join(shared), ', '.join(release_order))
+        )
+
+    target_lookup = dict(target_schema)
+    release_lookup = dict(release_schema)
+    for name in shared:
+        for prop, expected in target_lookup[name].items():
+            actual = release_lookup[name].get(prop)
+            if actual != expected:
+                differences.append(
+                    f'{name} {prop} changed from {expected!r} to {actual!r}'
+                )
+    return differences
 
 
 def _stage_branch(
@@ -564,10 +654,16 @@ def _stage_branch(
     '''stage, append, and validate either the line or point branch'''
 
     safe = 'lines' if branch.shape_type == 'Polyline' else 'points'
-    branch.staged_target = os.path.join(gdb, f'{safe}_historical')
     copied_new = os.path.join(gdb, f'{safe}_new_source')
     branch.staged_new = os.path.join(gdb, f'{safe}_new_projected')
-    branch.staged_output = os.path.join(gdb, f'{safe}_complete')
+
+    # the historical copy and the combined output stay shapefiles: a file
+    # geodatabase round trip adds Shape_Length and widens dBASE numeric fields,
+    # which would publish a schema the production target does not have
+    work_dir = os.path.join(os.path.dirname(gdb), 'work')
+    os.makedirs(work_dir, exist_ok=True)
+    branch.staged_target = os.path.join(work_dir, f'{safe}_historical.shp')
+    branch.staged_output = os.path.join(work_dir, f'{safe}_complete.shp')
 
     # copy the complete target but only the selected new records into staging
     arcpy.AddMessage(f'Copying the complete historical {branch.label.lower()} target...')
@@ -599,13 +695,13 @@ def _stage_branch(
             f'Projection produced {nulls} empty {branch.label.lower()} geometries. '
             'Run Check Geometry on the source data and try again.'
         )
-    invalids = _invalid_geometry_count(
-        branch.staged_new, os.path.join(gdb, f'{safe}_new_geometry_problems')
-    )
+    problem_table = os.path.join(gdb, f'{safe}_new_geometry_problems')
+    invalids, detail = _geometry_problems(branch.staged_new, problem_table)
     if invalids:
         raise ValueError(
             f'ArcGIS found {invalids} geometry problem(s) in the projected new '
             f'{branch.label.lower()}. Repair the source geometry and run the tool again.'
+            + (f' Reported: {detail}.' if detail else '')
         )
 
     # fill required fields, map them explicitly, and append to a copy of the target
@@ -625,13 +721,13 @@ def _stage_branch(
         raise ValueError(
             f'The complete {branch.label.lower()} output contains empty geometry.'
         )
-    invalids = _invalid_geometry_count(
-        branch.staged_output, os.path.join(gdb, f'{safe}_complete_geometry_problems')
-    )
+    problem_table = os.path.join(gdb, f'{safe}_complete_geometry_problems')
+    invalids, detail = _geometry_problems(branch.staged_output, problem_table)
     if invalids:
         raise ValueError(
             f'ArcGIS found {invalids} geometry problem(s) after combining the '
             f'{branch.label.lower()}. No release files were published.'
+            + (f' Reported: {detail}.' if detail else '')
         )
     output_sr = _valid_spatial_reference(
         branch.staged_output, f'Complete {branch.label.lower()}'
@@ -658,16 +754,18 @@ def _stage_branch(
     if not _same_spatial_reference(release_sr, branch.target_sr):
         raise ValueError(f'Packaged {branch.label.lower()} has the wrong coordinate system.')
     if release_schema != target_schema:
+        differences = _schema_differences(target_schema, release_schema)
+        detail = '; '.join(differences) or 'no individual difference could be isolated'
         raise ValueError(
-            f'Packaged {branch.label.lower()} schema does not match its production target. '
-            'A field name, order, type, length, precision, scale, or nullability changed.'
+            f'Packaged {branch.label.lower()} schema does not match its production '
+            f'target: {detail}.'
         )
-    invalids = _invalid_geometry_count(
-        branch.staged_release, os.path.join(gdb, f'{safe}_release_geometry_problems')
-    )
+    problem_table = os.path.join(gdb, f'{safe}_release_geometry_problems')
+    invalids, detail = _geometry_problems(branch.staged_release, problem_table)
     if invalids:
         raise ValueError(
             f'Packaged {branch.label.lower()} contains {invalids} geometry problem(s).'
+            + (f' Reported: {detail}.' if detail else '')
         )
     qa_rows.extend([
         _qa(branch.label, 'target_input_path', 'PASS', branch.target_path,
@@ -1030,10 +1128,10 @@ def execute(
         ):
             if path:
                 arcpy.AddMessage(f'Created: {path}')
-        arcpy.AddWarning(
-            'Complete visual review before publishing to Mapbox: compare the old and new '
-            'layers in ArcGIS Pro '
-            'and confirm arrow placement, rotation, herd, season, class, and type.'
+        arcpy.AddMessage(
+            'Next step: complete visual review before publishing to Mapbox. Compare the '
+            'old and new layers in ArcGIS Pro and confirm arrow placement, rotation, '
+            'herd, season, class, and type.'
         )
         return result
     except Exception:
@@ -1046,9 +1144,4 @@ def execute(
                 arcpy.AddWarning(f'Could not remove partial release file {path}: {cleanup_error}')
         raise
     finally:
-        try:
-            shutil.rmtree(staging_root)
-        except OSError as cleanup_error:
-            arcpy.AddWarning(
-                f'Could not remove temporary staging folder {staging_root}: {cleanup_error}'
-            )
+        _remove_staging_root(staging_root)

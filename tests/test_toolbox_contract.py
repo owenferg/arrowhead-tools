@@ -101,7 +101,7 @@ class ToolboxContractTests(unittest.TestCase):
         )
         self.assertEqual(
             self.toolbox.IntegrateGIUMArrowData().label,
-            "Integrate Arrow Data into GIUM Atlas Layers",
+            "Integrate Data into Existing GIUM Layers",
         )
 
     def test_creation_parameter_defaults_and_execute_forwarding(self):
@@ -130,7 +130,7 @@ class ToolboxContractTests(unittest.TestCase):
         )
         self.assertFalse(parameters[2].enabled)
         self.assertEqual(parameters[3].value, "Rotation")
-        self.assertEqual(parameters[4].value, 3)
+        self.assertEqual(parameters[4].value, 0)
         self.assertEqual(parameters[5].schema.geometryType, "Point")
 
         values = [

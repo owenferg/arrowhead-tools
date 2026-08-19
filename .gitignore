@@ -19,3 +19,14 @@ htmlcov/
 
 # packaged toolbox releases
 releases/
+
+# ArcGIS Pro tool metadata written next to the toolbox when a tool is opened
+*.pyt.xml
+
+# ArcGIS schema locks and scratch data left behind by testing
+*.lock
+*.gdb/
+scratch/
+.gium_arrow_staging_*/
+
+.agents/

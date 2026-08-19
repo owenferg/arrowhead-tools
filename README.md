@@ -32,7 +32,7 @@ In ArcGIS Pro, add `arrow_tools.pyt` to the Catalog pane. The toolbox includes t
 
 - **Create Arrowheads from Line Endpoints** creates a new arrowhead point layer when you only have lines.
 - **Update Existing Arrowhead Rotations** updates arrowhead points that already exist.
-- **Integrate Arrow Data into GIUM Atlas Layers** creates safe, dated GIUM line and point-label releases from new lines and Part 1 arrowheads.
+- **Integrate Data into Existing GIUM Layers** creates safe, dated GIUM line and point-label releases from new lines and Part 1 arrowheads.
 
 ## Test
 
