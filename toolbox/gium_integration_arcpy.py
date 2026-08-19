@@ -172,9 +172,15 @@ def _choose_transformation(
         arcpy.AddMessage(f'{label} will use geographic transformation: {selected}')
         return selected
     if _gcs_code(source_sr) != _gcs_code(target_sr):
+        source_gcs = getattr(getattr(source_sr, 'GCS', None), 'name', 'unknown')
+        target_gcs = getattr(getattr(target_sr, 'GCS', None), 'name', 'unknown')
+        target_name = getattr(target_sr, 'name', 'the target coordinate system')
         raise ValueError(
-            f'ArcGIS could not find a geographic transformation for {label.lower()}. '
-            'Confirm the input coordinate system and install any required ArcGIS coordinate-system data.'
+            f'ArcGIS has no geographic transformation from {source_gcs} to '
+            f'{target_gcs} covering the area of these {label.lower()}, so this tool '
+            f'cannot project them safely. Run the ArcGIS Pro Project tool on the new '
+            f'{label.lower()} to convert them to {target_name} first, then choose the '
+            'projected layer here and run this tool again.'
         )
     return ''
 
@@ -352,6 +358,53 @@ def _compatible(source_field, target_field, allow_numeric_conversion=False) -> b
         and source_field.type in _NUMERIC_FIELD_TYPES
         and target_field.type in _NUMERIC_FIELD_TYPES
     )
+
+
+def _missing_required_values(branch: _Branch) -> List[str]:
+    '''report every required GIUM value the release cannot supply yet
+
+    checked before any copying so a blank metadata box fails in seconds rather
+    than after the historical target has been copied and projected.
+    '''
+
+    resolved = _resolved_fields(branch.new_input, branch.profile, required=False)
+    problems: List[str] = []
+    countable = []
+    for role in branch.roles:
+        # an entered value fills every blank, so the source data cannot fall short
+        if not core.is_blank(branch.fallbacks.get(role)):
+            continue
+        source_field = resolved.get(role)
+        if source_field is None:
+            aliases = ', '.join(branch.profile.aliases.get(role, ()))
+            problems.append(
+                f'{branch.label}: no {role} field (accepted names: {aliases}) and no '
+                f'{role} value entered, so every feature would be missing it.'
+            )
+            continue
+        countable.append((role, source_field.name))
+
+    if not countable:
+        return problems
+
+    blanks = {role: 0 for role, _ in countable}
+    total = 0
+    with arcpy.da.SearchCursor(
+        branch.new_input, [name for _, name in countable]
+    ) as rows:
+        for row in rows:
+            total += 1
+            for index, (role, _) in enumerate(countable):
+                if core.is_blank(row[index]):
+                    blanks[role] += 1
+
+    for role, field_name in countable:
+        if blanks[role]:
+            problems.append(
+                f'{branch.label}: {blanks[role]} of {total} features have a blank '
+                f'{field_name} and no {role} value was entered.'
+            )
+    return problems
 
 
 def _prepare_role_fields(branch: _Branch) -> None:
@@ -811,6 +864,16 @@ def execute(
     arcpy.AddMessage('Checking inputs before creating release files...')
     for branch in branches:
         _validate_branch(branch)
+
+    missing_values = []
+    for branch in branches:
+        missing_values.extend(_missing_required_values(branch))
+    if missing_values:
+        raise ValueError(
+            'Required GIUM values are missing. Enter the value in the tool to fill '
+            'blanks, or populate the field on the new data, then run again:\n- '
+            + '\n- '.join(missing_values)
+        )
 
     # make sure an unusual output path cannot replace an input
     final_paths = [path for path in vars(result).values() if path]

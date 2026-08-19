@@ -76,9 +76,20 @@ Open "Integrate Arrow Data into GIUM Atlas Layers"
   on this historical target so old features are not accidentally omitted.
 - New seasonal arrow lines: choose the new line layer. Selections and definition
   queries are honored.
+- Line geographic transformation: Optional; only needed when the new lines and the
+  existing target use different datums. The tool fills in ArcGIS Pro's recommended
+  transformation once both line layers are chosen, so leave it alone unless you 
+  require a specific one. The dropdown stays empty when both layers already
+  share a coordinate system, and any value entered then is ignored. If the datums
+  differ but the dropdown is still empty, ArcGIS has no transformation that covers
+  your area and this tool will stop. Run the ArcGIS Pro Project tool on the new
+  lines to convert them to the target coordinate system, then choose that projected
+  layer here and run again.
 - Existing GIUMPointLabels target: choose the complete latest point-label
   shapefile (.shp), not a geodatabase feature class.
 - New arrowhead points: choose the arrowhead output made by the first tool.
+- Point geographic transformation: Optional; works exactly like the line version
+  above, but for the two point layers.
 - Herd name, Country, Season, Line class, and Point type fill blank values on the new
   features only. Values that are already present are preserved. Point type defaults
   to "Arrowhead".
