@@ -17,7 +17,7 @@ import time
 import zipfile
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-import arcpy
+import arcpy  # pyright: ignore[reportMissingImports]
 import gium_integration_core as core
 
 

@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 import os
 from typing import Dict, Iterator, List, Optional, Tuple
-import arcpy
+import arcpy  # pyright: ignore[reportMissingImports]
 from arrow_rotation_core import clockwise_angle_from_east, endpoints_from_part
 
 

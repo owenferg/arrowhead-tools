@@ -6,7 +6,7 @@ created by Owen Ferguson
 import importlib
 import datetime
 import os
-import arcpy
+import arcpy  # pyright: ignore[reportMissingImports]
 import arrow_rotation_core
 import arrow_creation_arcpy
 import arrow_rotation_arcpy

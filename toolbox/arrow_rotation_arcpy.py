@@ -7,7 +7,7 @@ from dataclasses import replace
 import math
 import os
 from typing import Dict, Iterator, List, Optional, Tuple
-import arcpy
+import arcpy  # pyright: ignore[reportMissingImports]
 from arrow_rotation_core import (
     Endpoint,
     EndpointIndex,
