@@ -15,17 +15,48 @@ PACKAGE = pathlib.Path(__file__).resolve().parents[1] / "toolbox"
 sys.path.insert(0, str(PACKAGE))
 
 
+class Filter:
+    '''small arcpy filter stand-in for value lists and geometry filters'''
+
+    def __init__(self):
+        self.type = None
+        self.list = []
+
+
 class Parameter:
     '''small arcpy parameter stand-in for loading the python toolbox'''
 
     def __init__(self, **values):
-        self.__dict__.update(values)
-        self.filter = types.SimpleNamespace(list=[])
-        self.schema = types.SimpleNamespace(clone=False)
+        self.displayName = None
+        self.name = None
+        self.datatype = None
+        self.parameterType = None
+        self.direction = None
+        self.category = None
+        self.multiValue = False
+        self.filter = Filter()
+        self.schema = types.SimpleNamespace(clone=False, geometryType=None)
         self.value = None
+        self.values = None
         self.altered = False
         self.enabled = True
         self.error = None
+        self.warning = None
+        self.parameterDependencies = []
+        self._columns = []
+        self.filters = []
+        self.__dict__.update(values)
+        if not isinstance(getattr(self, "filter", None), Filter):
+            self.filter = Filter()
+
+    @property
+    def columns(self):
+        return self._columns
+
+    @columns.setter
+    def columns(self, value):
+        self._columns = value
+        self.filters = [Filter() for _unused in value]
 
     @property
     def valueAsText(self):
@@ -33,6 +64,9 @@ class Parameter:
 
     def setErrorMessage(self, message):
         self.error = message
+
+    def setWarningMessage(self, message):
+        self.warning = message
 
 
 class ToolboxContractTests(unittest.TestCase):
@@ -50,16 +84,31 @@ class ToolboxContractTests(unittest.TestCase):
         def describe(value):
             path = pathlib.Path(str(value))
             is_geodatabase = str(path).lower().endswith(".gdb")
+            suffix = path.suffix.lower()
+            shape_type = None
+            if suffix == ".shp":
+                name = path.stem.lower()
+                if "point" in name:
+                    shape_type = "Point"
+                elif "poly" in name or "area" in name:
+                    shape_type = "Polygon"
+                else:
+                    shape_type = "Polyline"
             return types.SimpleNamespace(
                 baseName=path.stem,
                 catalogPath=str(value),
                 path=str(path.parent),
                 dataType="Workspace" if is_geodatabase else "Folder",
                 workspaceType="LocalDatabase" if is_geodatabase else "FileSystem",
+                shapeType=shape_type,
             )
 
         arcpy.Describe = describe
         arcpy.Exists = lambda value: pathlib.Path(str(value)).exists()
+        arcpy.ListFields = lambda dataset: []
+        arcpy.da = types.SimpleNamespace(
+            SearchCursor=lambda dataset, fields: iter(()),
+        )
         arcpy.ValidateTableName = lambda name, workspace: name.replace(" ", "_")
         arcpy.mp = types.SimpleNamespace(
             ArcGISProject=lambda project: types.SimpleNamespace(
@@ -88,7 +137,7 @@ class ToolboxContractTests(unittest.TestCase):
             [
                 self.toolbox.CreateArrowheadsFromLineEndpoints,
                 self.toolbox.RotateArrowheads,
-                self.toolbox.IntegrateGIUMArrowData,
+                self.toolbox.IntegrateGIUMData,
             ],
         )
         self.assertEqual(
@@ -100,7 +149,7 @@ class ToolboxContractTests(unittest.TestCase):
             "Update Existing Arrowhead Rotations",
         )
         self.assertEqual(
-            self.toolbox.IntegrateGIUMArrowData().label,
+            self.toolbox.IntegrateGIUMData().label,
             "Integrate Data into Existing GIUM Layers",
         )
 
@@ -259,171 +308,185 @@ class ToolboxContractTests(unittest.TestCase):
         )
         self.assertEqual(parameters[6].value, "points")
 
-    def test_gium_parameter_contract_branch_enablement_and_forwarding(self):
-        tool = self.toolbox.IntegrateGIUMArrowData()
+    def test_gium_parameter_contract_and_forwarding(self):
+        tool = self.toolbox.IntegrateGIUMData()
         parameters = tool.getParameterInfo()
         self.assertEqual(
             [parameter.name for parameter in parameters],
             [
-                "process_lines",
-                "line_target",
-                "new_lines",
-                "line_transformation",
-                "process_points",
-                "point_target",
-                "new_points",
-                "point_transformation",
+                "datasets",
                 "herd_name",
                 "country",
-                "season",
-                "line_class",
-                "point_type",
                 "release_date",
                 "output_folder",
-                "line_output",
-                "line_zip",
-                "point_output",
-                "point_geojson",
+                "created_files",
                 "qa_csv",
             ],
         )
-        self.assertIs(parameters[0].value, True)
-        self.assertIs(parameters[4].value, True)
-        self.assertEqual(parameters[1].filter.list, ["Polyline"])
-        self.assertEqual(parameters[2].filter.list, ["Polyline"])
-        self.assertEqual(parameters[5].filter.list, ["Point"])
-        self.assertEqual(parameters[6].filter.list, ["Point"])
-        self.assertEqual(parameters[12].value, "Arrowhead")
-        self.assertEqual(parameters[15].schema.geometryType, "Polyline")
-        self.assertEqual(parameters[17].schema.geometryType, "Point")
+        self.assertEqual(parameters[0].datatype, "GPValueTable")
+        self.assertEqual(
+            [column[1] for column in parameters[0].columns],
+            [
+                "Layer type",
+                "Existing production shapefile (.shp)",
+                "New data",
+                "Class",
+                "Type",
+                "Season",
+                "Package as",
+                "Geographic transformation",
+            ],
+        )
+        self.assertEqual(parameters[0].filters[0].type, "ValueList")
+        self.assertIn("Seasonal arrows", parameters[0].filters[0].list)
+        self.assertIn("Other", parameters[0].filters[0].list)
+        self.assertEqual(parameters[0].filters[6].list, [
+            "Zipped shapefile", "GeoJSON", "Both",
+        ])
+        self.assertTrue(parameters[5].multiValue)
 
-        parameters[0].value = False
-        parameters[4].value = True
-        tool.updateParameters(parameters)
-        self.assertFalse(parameters[1].enabled)
-        self.assertFalse(parameters[2].enabled)
-        self.assertFalse(parameters[3].enabled)
-        self.assertTrue(parameters[9].enabled)
-        self.assertFalse(parameters[11].enabled)
-        self.assertTrue(parameters[5].enabled)
-        self.assertTrue(parameters[6].enabled)
-        self.assertTrue(parameters[12].enabled)
-
-        values = [
-            True,
-            "old_lines",
+        rows = [[
+            "Seasonal arrows",
+            "old_lines.shp",
             "new_lines",
-            "LINE_TRANSFORM",
-            True,
-            "old_points",
-            "new_points",
-            "POINT_TRANSFORM",
-            "Test Herd",
-            "Test Country",
-            "Spring migration",
             "Migration",
-            "Arrowhead",
-            "2026-08-04",
-            "/release",
-        ]
-        for parameter, value in zip(parameters[:15], values):
-            parameter.value = value
+            "",
+            "Spring migration",
+            "",
+            "LINE_TRANSFORM",
+        ]]
+        parameters[0].values = rows
+        parameters[1].value = "Test Herd"
+        parameters[2].value = "Test Country"
+        parameters[3].value = "2026-08-04"
+        parameters[4].value = "/release"
 
         forwarded = []
         self.toolbox.gium_integration_arcpy.execute = lambda *args: (
             forwarded.append(args)
             or {
-                "line_output": "/release/lines.shp",
-                "line_zip": "/release/lines.zip",
-                "point_output": "/release/points.shp",
-                "point_geojson": "/release/points.geojson",
+                "created": ["/release/lines.shp", "/release/lines.zip"],
                 "qa_csv": "/release/qa.csv",
             }
         )
         tool.execute(parameters, None)
 
-        self.assertEqual(forwarded, [tuple(values)])
-        self.assertEqual(parameters[15].value, "/release/lines.shp")
-        self.assertEqual(parameters[16].value, "/release/lines.zip")
-        self.assertEqual(parameters[17].value, "/release/points.shp")
-        self.assertEqual(parameters[18].value, "/release/points.geojson")
-        self.assertEqual(parameters[19].value, "/release/qa.csv")
+        self.assertEqual(
+            forwarded,
+            [(rows, "Test Herd", "Test Country", "2026-08-04", "/release")],
+        )
+        self.assertEqual(parameters[5].value, ["/release/lines.shp", "/release/lines.zip"])
+        self.assertEqual(parameters[6].value, "/release/qa.csv")
 
-    def test_gium_messages_require_enabled_branch_inputs(self):
-        tool = self.toolbox.IntegrateGIUMArrowData()
+    def test_gium_messages_require_table_rows(self):
+        tool = self.toolbox.IntegrateGIUMData()
         parameters = tool.getParameterInfo()
-        parameters[14].value = str(pathlib.Path(self.temp_directory.name))
+        parameters[4].value = str(pathlib.Path(self.temp_directory.name))
 
         tool.updateMessages(parameters)
 
-        self.assertEqual(
-            parameters[1].error,
-            "Choose the complete latest SeasonalArrows layer.",
-        )
-        self.assertEqual(parameters[2].error, "Choose the new seasonal arrow lines.")
-        self.assertEqual(
-            parameters[5].error,
-            "Choose the complete latest GIUMPointLabels layer.",
-        )
-        self.assertEqual(
-            parameters[6].error,
-            "Choose the new arrowheads created by Part 1.",
-        )
+        self.assertEqual(parameters[0].error, "Add at least one dataset to the table.")
 
     def test_gium_messages_reject_non_shapefile_targets_before_run(self):
-        tool = self.toolbox.IntegrateGIUMArrowData()
+        tool = self.toolbox.IntegrateGIUMData()
         parameters = tool.getParameterInfo()
-        parameters[1].value = str(self.workspace / "SeasonalArrows")
-        parameters[2].value = "new_lines"
-        parameters[5].value = str(self.workspace / "GIUMPointLabels")
-        parameters[6].value = "new_points"
-        parameters[14].value = str(pathlib.Path(self.temp_directory.name))
+        parameters[0].values = [[
+            "Seasonal arrows",
+            str(self.workspace / "SeasonalArrows"),
+            "new_lines",
+            "", "", "", "", "",
+        ]]
+        parameters[3].value = "2026-08-04"
+        parameters[4].value = str(pathlib.Path(self.temp_directory.name))
 
         tool.updateMessages(parameters)
 
-        self.assertIn("production .shp file", parameters[1].error)
-        self.assertIn("production .shp file", parameters[5].error)
+        self.assertIn("production .shp file", parameters[0].error)
 
-    def test_gium_point_only_defaults_ignore_disabled_line_target(self):
-        tool = self.toolbox.IntegrateGIUMArrowData()
+    def test_gium_output_folder_defaults_from_the_first_target(self):
+        tool = self.toolbox.IntegrateGIUMData()
         parameters = tool.getParameterInfo()
-        parameters[0].value = False
-        parameters[1].value = "/stale/line/target.shp"
-        parameters[4].value = True
-        parameters[5].value = "/current/point/target.shp"
+        parameters[0].values = [[
+            "GIUM point labels",
+            "/current/point/target.shp",
+            "new_points",
+            "", "Arrowhead", "", "", "",
+        ]]
         captured = []
-        self.toolbox._default_release_folder = lambda line, point: (
-            captured.append((line, point)) or "/current/point"
+        self.toolbox._default_release_folder = lambda *datasets: (
+            captured.append(datasets) or "/current/point"
         )
 
         tool.updateParameters(parameters)
 
-        self.assertEqual(captured, [(None, "/current/point/target.shp")])
-        self.assertTrue(parameters[9].enabled)
-        self.assertEqual(parameters[14].value, "/current/point")
+        self.assertEqual(captured, [("/current/point/target.shp",)])
+        self.assertEqual(parameters[4].value, "/current/point")
 
-    def test_gium_generated_transformation_tracks_layer_changes(self):
-        tool = self.toolbox.IntegrateGIUMArrowData()
+    def test_gium_spellcheck_warns_on_unknown_class_values(self):
+        tool = self.toolbox.IntegrateGIUMData()
         parameters = tool.getParameterInfo()
-        parameters[1].value = "old_lines"
-        parameters[2].value = "new_lines"
-        parameters[5].value = "old_points"
-        parameters[6].value = "new_points"
-        self.toolbox._available_transformations = lambda source, target: ["BEST", "OTHER"]
+        target = str(pathlib.Path(self.temp_directory.name) / "linear_barriers.shp")
+        pathlib.Path(target).write_text("placeholder")
+        parameters[0].values = [[
+            "Linear barriers",
+            target,
+            "new_lines",
+            "fence",
+            "", "", "", "",
+        ]]
+        parameters[3].value = "2026-08-04"
+        parameters[4].value = str(pathlib.Path(self.temp_directory.name))
+        self.toolbox.arcpy.ListFields = lambda dataset: [
+            types.SimpleNamespace(name="Class", type="String")
+        ]
 
-        tool.updateParameters(parameters)
+        class DistinctCursor:
+            def __enter__(self):
+                return iter([("Fence",), ("Railway",)])
 
-        self.assertEqual(parameters[3].filter.list, ["BEST", "OTHER"])
-        self.assertEqual(parameters[3].value, "BEST")
-        parameters[3].altered = True
-        self.toolbox._available_transformations = lambda source, target: []
+            def __exit__(self, *unused):
+                return False
 
-        tool.updateParameters(parameters)
+        self.toolbox.arcpy.da.SearchCursor = lambda dataset, fields: DistinctCursor()
 
-        self.assertEqual(parameters[3].filter.list, [])
-        self.assertIsNone(parameters[3].value)
-        self.assertEqual(parameters[7].filter.list, [])
-        self.assertIsNone(parameters[7].value)
+        tool.updateMessages(parameters)
+
+        self.assertIn("fence", parameters[0].warning)
+        self.assertIn("Fence, Railway", parameters[0].warning)
+
+    def test_gium_spellcheck_does_not_warn_on_new_season(self):
+        tool = self.toolbox.IntegrateGIUMData()
+        parameters = tool.getParameterInfo()
+        target = str(pathlib.Path(self.temp_directory.name) / "SeasonalArrows.shp")
+        pathlib.Path(target).write_text("placeholder")
+        parameters[0].values = [[
+            "Seasonal arrows",
+            target,
+            "new_lines",
+            "",
+            "",
+            "Calving",
+            "",
+            "",
+        ]]
+        parameters[3].value = "2026-08-04"
+        parameters[4].value = str(pathlib.Path(self.temp_directory.name))
+        self.toolbox.arcpy.ListFields = lambda dataset: [
+            types.SimpleNamespace(name="Season", type="String")
+        ]
+
+        class DistinctCursor:
+            def __enter__(self):
+                return iter([("Spring migration",), ("Fall migration",)])
+
+            def __exit__(self, *unused):
+                return False
+
+        self.toolbox.arcpy.da.SearchCursor = lambda dataset, fields: DistinctCursor()
+
+        tool.updateMessages(parameters)
+
+        self.assertIsNone(parameters[0].warning)
 
     def test_available_transformations_uses_arcgis_recommendation_order(self):
         source_sr = types.SimpleNamespace(name="WGS 1984", factoryCode=4326)

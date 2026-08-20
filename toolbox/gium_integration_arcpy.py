@@ -1,5 +1,5 @@
 '''
-arcpy adapter for integrating new arrow data into GIUM release datasets
+arcpy adapter for integrating new data into GIUM release datasets
 
 the historical datasets are used as templates and are never edited. new features
 are staged, checked, and packaged before anything is copied to the release folder.
@@ -21,8 +21,6 @@ import arcpy  # pyright: ignore[reportMissingImports]
 import gium_integration_core as core
 
 
-_LINE_ROLES = ('herd', 'country', 'season', 'class')
-_POINT_ROLES = ('herd', 'season', 'type', 'rotation')
 _SYSTEM_FIELD_TYPES = {'OID', 'Geometry', 'Blob', 'Raster', 'GlobalID'}
 _NUMERIC_FIELD_TYPES = {'SmallInteger', 'Integer', 'BigInteger', 'Single', 'Double'}
 _ADD_FIELD_TYPES = {
@@ -37,26 +35,30 @@ _ADD_FIELD_TYPES = {
 class IntegrationResult:
     '''paths returned to the ArcGIS toolbox as derived outputs'''
 
-    line_output: Optional[str] = None
-    line_zip: Optional[str] = None
-    point_output: Optional[str] = None
-    point_geojson: Optional[str] = None
+    created: List[str] = field(default_factory=list)
     qa_csv: Optional[str] = None
 
 
 @dataclass
-class _Branch:
-    '''inputs and working paths for either the line or point half of a release'''
+class _Dataset:
+    '''inputs and working paths for one row of a multi-dataset release'''
 
+    index: int
+    profile: object
     label: str
     shape_type: str
     target_input: object
     new_input: object
     requested_transformation: str
-    roles: Tuple[str, ...]
-    profile: object
+    package_choice: object
+    package_formats: Tuple[str, ...]
     fallbacks: Dict[str, object]
-    output_name: str
+    roles: Tuple[str, ...] = ()
+    managed_roles: Tuple[str, ...] = ()
+    output_name: str = ''
+    shapefile_path: str = ''
+    zip_path: Optional[str] = None
+    geojson_path: Optional[str] = None
     target_path: str = ''
     target_sr: object = None
     source_sr: object = None
@@ -164,7 +166,7 @@ def _choose_transformation(
         if not exact:
             choices = ', '.join(available[:5]) or 'none reported by ArcGIS'
             raise ValueError(
-                f'The selected {label.lower()} geographic transformation {requested!r} is '
+                f'The selected {label} geographic transformation {requested!r} is '
                 f'not valid for these datasets. Available choices: {choices}.'
             )
         return exact
@@ -178,9 +180,9 @@ def _choose_transformation(
         target_name = getattr(target_sr, 'name', 'the target coordinate system')
         raise ValueError(
             f'ArcGIS has no geographic transformation from {source_gcs} to '
-            f'{target_gcs} covering the area of these {label.lower()}, so this tool '
+            f'{target_gcs} covering the area of these {label} features, so this tool '
             f'cannot project them safely. Run the ArcGIS Pro Project tool on the new '
-            f'{label.lower()} to convert them to {target_name} first, then choose the '
+            f'data to convert them to {target_name} first, then choose the '
             'projected layer here and run this tool again.'
         )
     return ''
@@ -217,33 +219,51 @@ def _validate_output_folder(output_folder: str, create: bool = False) -> str:
     return output_folder
 
 
-def _artifact_paths(output_folder: str, release_date, process_lines, process_points):
-    '''build only the output paths needed by the enabled branches'''
+def _assign_artifact_paths(dataset: _Dataset, output_folder: str, release_date) -> None:
+    '''fill the dated output paths for one validated dataset'''
 
-    paths = core.release_artifact_paths(output_folder, release_date)
-    result = IntegrationResult(qa_csv=paths['qa_csv'])
-    if process_lines:
-        result.line_output = paths['line_shapefile']
-        result.line_zip = paths['line_zip']
-    if process_points:
-        result.point_output = paths['point_shapefile']
-        result.point_geojson = paths['point_geojson']
-    return result
+    names = core.release_artifact_names(
+        dataset.profile,
+        release_date,
+        dataset.package_choice,
+        dataset.target_path,
+    )
+    dataset.output_name = names.shapefile
+    dataset.shapefile_path = os.path.join(output_folder, names.shapefile)
+    dataset.zip_path = os.path.join(output_folder, names.zip) if names.zip else None
+    dataset.geojson_path = (
+        os.path.join(output_folder, names.geojson) if names.geojson else None
+    )
 
 
-def _assert_no_collisions(result: IntegrationResult) -> None:
+def _planned_paths(datasets: Sequence[_Dataset], qa_csv: str) -> List[str]:
+    '''list every dated file this run intends to publish'''
+
+    paths = []
+    for dataset in datasets:
+        paths.append(dataset.shapefile_path)
+        if dataset.zip_path:
+            paths.append(dataset.zip_path)
+        if dataset.geojson_path:
+            paths.append(dataset.geojson_path)
+    paths.append(qa_csv)
+    return paths
+
+
+def _assert_no_collisions(paths: Sequence[str]) -> None:
     '''stop if any dated release file or shapefile sidecar already exists'''
 
     collisions = []
-    for path in (result.line_zip, result.point_geojson, result.qa_csv):
-        if path and os.path.exists(path):
-            collisions.append(path)
-    for shapefile in (result.line_output, result.point_output):
-        if shapefile:
-            base = os.path.splitext(shapefile)[0]
+    for path in paths:
+        if not path:
+            continue
+        if str(path).lower().endswith('.shp'):
+            base = os.path.splitext(path)[0]
             collisions.extend(
-                path for path in glob.glob(base + '.*') if os.path.exists(path)
+                item for item in glob.glob(base + '.*') if os.path.exists(item)
             )
+        elif os.path.exists(path):
+            collisions.append(path)
     if collisions:
         names = ', '.join(sorted({os.path.basename(path) for path in collisions}))
         raise ValueError(
@@ -252,79 +272,118 @@ def _assert_no_collisions(result: IntegrationResult) -> None:
         )
 
 
-def _validate_branch(branch: _Branch) -> None:
+def _multipart_count(dataset) -> int:
+    '''count new features Mapbox cannot import because they have more than one part'''
+
+    count = 0
+    with arcpy.da.SearchCursor(dataset, ['SHAPE@']) as rows:
+        for (geometry,) in rows:
+            if geometry is None:
+                continue
+            try:
+                if int(getattr(geometry, 'partCount', 1) or 1) > 1:
+                    count += 1
+            except (TypeError, ValueError):
+                continue
+    return count
+
+
+def _validate_dataset(dataset: _Dataset) -> None:
     '''validate one complete target and its selected new features'''
 
-    target_description = arcpy.Describe(branch.target_input)
-    source_description = arcpy.Describe(branch.new_input)
+    target_description = arcpy.Describe(dataset.target_input)
+    source_description = arcpy.Describe(dataset.new_input)
+    target_shape = getattr(target_description, 'shapeType', None)
+    source_shape = getattr(source_description, 'shapeType', None)
+    expected = dataset.profile.shape_type
 
-    # make sure both inputs are the right geometry type and do not contain joins
-    if getattr(target_description, 'shapeType', None) != branch.shape_type:
+    if expected:
+        if target_shape != expected:
+            raise ValueError(
+                f'The {dataset.label} target must contain {expected.lower()} features.'
+            )
+        if source_shape != expected:
+            raise ValueError(
+                f'The {dataset.label} new data must contain {expected.lower()} features.'
+            )
+        dataset.shape_type = expected
+    else:
+        if target_shape not in core.SUPPORTED_SHAPE_TYPES:
+            raise ValueError(
+                f'The {dataset.label} target must contain point, polyline, or polygon '
+                'features.'
+            )
+        if source_shape != target_shape:
+            raise ValueError(
+                f'The {dataset.label} new data must be the same geometry type as the '
+                f'target ({str(target_shape).lower()}).'
+            )
+        dataset.shape_type = target_shape
+
+    if any('.' in field.name for field in arcpy.ListFields(dataset.new_input)):
         raise ValueError(
-            f'{branch.label} target must contain {branch.shape_type.lower()} features.'
-        )
-    if getattr(source_description, 'shapeType', None) != branch.shape_type:
-        raise ValueError(
-            f'New {branch.label.lower()} must contain '
-            f'{branch.shape_type.lower()} features.'
-        )
-    if any('.' in field.name for field in arcpy.ListFields(branch.new_input)):
-        raise ValueError(
-            f'New {branch.label.lower()} has a joined table. Remove the join before '
+            f'The {dataset.label} new data has a joined table. Remove the join before '
             'running this tool so each source field can be mapped unambiguously.'
         )
 
     # use the target catalog path so a target selection cannot remove history
     # keep the new input as a layer so its selection or definition query is honored
-    branch.target_path = str(
-        getattr(target_description, 'catalogPath', branch.target_input)
+    dataset.target_path = str(
+        getattr(target_description, 'catalogPath', dataset.target_input)
     )
-    if os.path.splitext(branch.target_path)[1].casefold() != '.shp':
+    if os.path.splitext(dataset.target_path)[1].casefold() != '.shp':
         raise ValueError(
-            f'{branch.label} target must be the current production shapefile (.shp). '
+            f'The {dataset.label} target must be the current production shapefile (.shp). '
             'A geodatabase layer can contain longer field names or values that a shapefile '
             'would silently shorten, so it cannot safely define the release schema.'
         )
-    if _normalized_path(branch.target_path) == _normalized_path(
-        getattr(source_description, 'catalogPath', branch.new_input)
+    if _normalized_path(dataset.target_path) == _normalized_path(
+        getattr(source_description, 'catalogPath', dataset.new_input)
     ):
-        raise ValueError(f'{branch.label} target and new features must be different datasets.')
-    branch.target_sr = _valid_spatial_reference(
-        branch.target_path, f'{branch.label} target'
-    )
-    branch.source_sr = _valid_spatial_reference(
-        branch.new_input, f'New {branch.label.lower()}'
-    )
-    branch.historical_count = _count(branch.target_path)
-    if branch.historical_count <= 0:
         raise ValueError(
-            f'{branch.label} target contains no historical features. Select the latest '
-            'complete GIUM production shapefile, not an empty schema template.'
+            f'The {dataset.label} target and new data must be different datasets.'
         )
-    branch.new_count = _count(branch.new_input)
-    if branch.new_count <= 0:
+    dataset.target_sr = _valid_spatial_reference(
+        dataset.target_path, f'{dataset.label} target'
+    )
+    dataset.source_sr = _valid_spatial_reference(
+        dataset.new_input, f'{dataset.label} new data'
+    )
+    dataset.historical_count = _count(dataset.target_path)
+    if dataset.historical_count <= 0:
         raise ValueError(
-            f'New {branch.label.lower()} contains no selected features. Select the intended '
-            'features or clear the selection, then run the tool again.'
+            f'The {dataset.label} target contains no historical features. Select the '
+            'latest complete GIUM production shapefile, not an empty schema template.'
         )
-    branch.transformation = _choose_transformation(
-        branch.new_input, branch.source_sr, branch.target_sr,
-        branch.requested_transformation, branch.label,
+    dataset.new_count = _count(dataset.new_input)
+    if dataset.new_count <= 0:
+        raise ValueError(
+            f'The {dataset.label} new data contains no selected features. Select the '
+            'intended features or clear the selection, then run the tool again.'
+        )
+    multipart = _multipart_count(dataset.new_input)
+    if multipart:
+        raise ValueError(
+            f'{dataset.label}: {multipart} of {dataset.new_count} new features are '
+            'multipart. Mapbox cannot import multipart data. Run the Multipart To '
+            'Singlepart tool on the new data, then choose that result and run this '
+            'tool again.'
+        )
+    dataset.transformation = _choose_transformation(
+        dataset.new_input, dataset.source_sr, dataset.target_sr,
+        dataset.requested_transformation, dataset.label,
     )
 
-    branch.target_fields = _field_lookup(branch.target_path)
-    resolved_target = _resolved_fields(branch.target_path, branch.profile, required=True)
-    for role in branch.roles:
+    dataset.target_fields = _field_lookup(dataset.target_path)
+    resolved_target = _resolved_fields(
+        dataset.target_path, dataset.profile, required=False
+    )
+    dataset.managed_roles = core.present_roles(resolved_target)
+    dataset.roles = core.enforced_roles(dataset.profile, resolved_target)
+    for role in dataset.managed_roles:
         target_field = resolved_target[role]
         core.validate_role_field(role, target_field)
-        branch.target_role_fields[role] = target_field.name
-
-    # country is optional on point labels but is mapped when the target has it
-    if branch.label == 'Arrowhead points':
-        country = resolved_target.get('country')
-        if country:
-            core.validate_role_field('country', country)
-            branch.target_role_fields['country'] = country.name
+        dataset.target_role_fields[role] = target_field.name
 
 
 def _add_field_like(dataset, field) -> str:
@@ -361,25 +420,25 @@ def _compatible(source_field, target_field, allow_numeric_conversion=False) -> b
     )
 
 
-def _missing_required_values(branch: _Branch) -> List[str]:
+def _missing_required_values(dataset: _Dataset) -> List[str]:
     '''report every required GIUM value the release cannot supply yet
 
     checked before any copying so a blank metadata box fails in seconds rather
     than after the historical target has been copied and projected.
     '''
 
-    resolved = _resolved_fields(branch.new_input, branch.profile, required=False)
+    resolved = _resolved_fields(dataset.new_input, dataset.profile, required=False)
     problems: List[str] = []
     countable = []
-    for role in branch.roles:
+    for role in dataset.roles:
         # an entered value fills every blank, so the source data cannot fall short
-        if not core.is_blank(branch.fallbacks.get(role)):
+        if not core.is_blank(dataset.fallbacks.get(role)):
             continue
         source_field = resolved.get(role)
         if source_field is None:
-            aliases = ', '.join(branch.profile.aliases.get(role, ()))
+            aliases = ', '.join(dataset.profile.aliases.get(role, ()))
             problems.append(
-                f'{branch.label}: no {role} field (accepted names: {aliases}) and no '
+                f'{dataset.label}: no {role} field (accepted names: {aliases}) and no '
                 f'{role} value entered, so every feature would be missing it.'
             )
             continue
@@ -391,7 +450,7 @@ def _missing_required_values(branch: _Branch) -> List[str]:
     blanks = {role: 0 for role, _ in countable}
     total = 0
     with arcpy.da.SearchCursor(
-        branch.new_input, [name for _, name in countable]
+        dataset.new_input, [name for _, name in countable]
     ) as rows:
         for row in rows:
             total += 1
@@ -402,76 +461,77 @@ def _missing_required_values(branch: _Branch) -> List[str]:
     for role, field_name in countable:
         if blanks[role]:
             problems.append(
-                f'{branch.label}: {blanks[role]} of {total} features have a blank '
+                f'{dataset.label}: {blanks[role]} of {total} features have a blank '
                 f'{field_name} and no {role} value was entered.'
             )
     return problems
 
 
-def _prepare_role_fields(branch: _Branch) -> None:
+def _prepare_role_fields(dataset: _Dataset) -> None:
     '''add missing GIUM fields in staging and fill only blank values'''
 
-    source_fields = _field_lookup(branch.staged_new)
-    resolved_source = _resolved_fields(branch.staged_new, branch.profile, required=False)
-    roles = list(branch.roles)
-    if 'country' in branch.target_role_fields and 'country' not in roles:
-        roles.append('country')
+    source_fields = _field_lookup(dataset.staged_new)
+    resolved_source = _resolved_fields(dataset.staged_new, dataset.profile, required=False)
+    roles = list(dataset.managed_roles)
+    if not roles:
+        dataset.filled_counts = {}
+        return
 
     for role in roles:
-        target_field = branch.target_fields[branch.target_role_fields[role].lower()]
+        target_field = dataset.target_fields[dataset.target_role_fields[role].lower()]
         source_field = resolved_source.get(role)
         if source_field and not _compatible(
             source_field, target_field, allow_numeric_conversion=role == 'rotation'
         ):
             raise ValueError(
-                f'New {branch.label.lower()} field {source_field.name} is type '
+                f'The {dataset.label} field {source_field.name} is type '
                 f'{source_field.type}, but target field {target_field.name} is '
                 f'{target_field.type}. Correct the source field type before continuing.'
             )
         if not source_field:
             # add the target field to staging so an explicit FieldMap can use it
-            _add_field_like(branch.staged_new, target_field)
-            source_fields = _field_lookup(branch.staged_new)
+            _add_field_like(dataset.staged_new, target_field)
+            source_fields = _field_lookup(dataset.staged_new)
             source_field = source_fields[target_field.name.lower()]
-        branch.source_role_fields[role] = source_field.name
+        dataset.source_role_fields[role] = source_field.name
 
-    cursor_fields = ['OID@'] + [branch.source_role_fields[role] for role in roles]
-    branch.filled_counts = {role: 0 for role in roles}
-    with arcpy.da.UpdateCursor(branch.staged_new, cursor_fields) as rows:
+    cursor_fields = ['OID@'] + [dataset.source_role_fields[role] for role in roles]
+    dataset.filled_counts = {role: 0 for role in roles}
+    with arcpy.da.UpdateCursor(dataset.staged_new, cursor_fields) as rows:
         for row in rows:
             row = list(row)
             oid = row[0]
             changed = False
             for index, role in enumerate(roles, start=1):
                 source_value = row[index]
-                fallback = branch.fallbacks.get(role)
-                target_field = branch.target_fields[
-                    branch.target_role_fields[role].lower()
+                fallback = dataset.fallbacks.get(role)
+                target_field = dataset.target_fields[
+                    dataset.target_role_fields[role].lower()
                 ]
                 value = core.resolved_role_value(
                     role, source_value, fallback, target_field,
-                    required=role in branch.roles,
+                    required=role in dataset.roles,
                     context=f'feature {oid}',
                 )
                 if core.is_blank(source_value) and not core.is_blank(fallback):
-                    branch.filled_counts[role] += 1
+                    dataset.filled_counts[role] += 1
                     changed = True
                 row[index] = value
             if changed:
                 rows.updateRow(row)
 
 
-def _build_field_mappings(branch: _Branch):
+def _build_field_mappings(dataset: _Dataset):
     '''create explicit Append field mappings from new data to the target schema'''
 
-    source_fields = _field_lookup(branch.staged_new)
+    source_fields = _field_lookup(dataset.staged_new)
     role_by_target = {
-        name.lower(): role for role, name in branch.target_role_fields.items()
+        name.lower(): role for role, name in dataset.target_role_fields.items()
     }
     mappings = arcpy.FieldMappings()
     mapped = []
     extra_text_mappings = []
-    for target_field in arcpy.ListFields(branch.target_path):
+    for target_field in arcpy.ListFields(dataset.target_path):
         if (
             target_field.type in _SYSTEM_FIELD_TYPES
             or getattr(target_field, 'required', False)
@@ -479,13 +539,13 @@ def _build_field_mappings(branch: _Branch):
         ):
             continue
         role = role_by_target.get(target_field.name.lower())
-        source_name = branch.source_role_fields.get(role) if role else None
+        source_name = dataset.source_role_fields.get(role) if role else None
         if not source_name:
             same_name = source_fields.get(target_field.name.lower())
             if same_name:
                 if not _compatible(same_name, target_field):
                     raise ValueError(
-                        f'New {branch.label.lower()} field {same_name.name} is type '
+                        f'The {dataset.label} field {same_name.name} is type '
                         f'{same_name.type}, but the same-named target field is '
                         f'{target_field.type}. ArcGIS could coerce or lose values; correct '
                         'the source field type before continuing.'
@@ -494,7 +554,7 @@ def _build_field_mappings(branch: _Branch):
         if not source_name:
             continue
         field_map = arcpy.FieldMap()
-        field_map.addInputField(branch.staged_new, source_name)
+        field_map.addInputField(dataset.staged_new, source_name)
         output_field = field_map.outputField
         output_field.name = target_field.name
         output_field.aliasName = getattr(target_field, 'aliasName', target_field.name)
@@ -504,9 +564,9 @@ def _build_field_mappings(branch: _Branch):
         if role is None and target_field.type == 'String':
             extra_text_mappings.append((source_name, target_field))
     if not mapped:
-        raise ValueError(f'No compatible fields could be mapped for {branch.label.lower()}.')
+        raise ValueError(f'No compatible fields could be mapped for {dataset.label}.')
     for source_name, target_field in extra_text_mappings:
-        with arcpy.da.SearchCursor(branch.staged_new, ['OID@', source_name]) as rows:
+        with arcpy.da.SearchCursor(dataset.staged_new, ['OID@', source_name]) as rows:
             for oid, value in rows:
                 try:
                     core.validate_value_for_field(
@@ -514,7 +574,7 @@ def _build_field_mappings(branch: _Branch):
                     )
                 except ValueError as error:
                     raise ValueError(f'Feature {oid}: {error}') from None
-    arcpy.AddMessage(f'{branch.label} field mapping: {", ".join(mapped)}')
+    arcpy.AddMessage(f'{dataset.label} field mapping: {", ".join(mapped)}')
     return mappings, mapped
 
 
@@ -645,175 +705,180 @@ def _schema_differences(target_schema, release_schema) -> List[str]:
     return differences
 
 
-def _stage_branch(
-    branch: _Branch,
+def _stage_dataset(
+    dataset: _Dataset,
     gdb: str,
     release_dir: str,
     qa_rows: List[core.QARow],
 ):
-    '''stage, append, and validate either the line or point branch'''
+    '''stage, append, and validate one dataset in the release'''
 
-    safe = 'lines' if branch.shape_type == 'Polyline' else 'points'
+    safe = f'row{dataset.index}'
     copied_new = os.path.join(gdb, f'{safe}_new_source')
-    branch.staged_new = os.path.join(gdb, f'{safe}_new_projected')
+    dataset.staged_new = os.path.join(gdb, f'{safe}_new_projected')
 
     # the historical copy and the combined output stay shapefiles: a file
     # geodatabase round trip adds Shape_Length and widens dBASE numeric fields,
     # which would publish a schema the production target does not have
     work_dir = os.path.join(os.path.dirname(gdb), 'work')
     os.makedirs(work_dir, exist_ok=True)
-    branch.staged_target = os.path.join(work_dir, f'{safe}_historical.shp')
-    branch.staged_output = os.path.join(work_dir, f'{safe}_complete.shp')
+    dataset.staged_target = os.path.join(work_dir, f'{safe}_historical.shp')
+    dataset.staged_output = os.path.join(work_dir, f'{safe}_complete.shp')
 
     # copy the complete target but only the selected new records into staging
-    arcpy.AddMessage(f'Copying the complete historical {branch.label.lower()} target...')
-    arcpy.management.CopyFeatures(branch.target_path, branch.staged_target)
-    arcpy.management.CopyFeatures(branch.new_input, copied_new)
-    if _count(copied_new) != branch.new_count:
-        raise ValueError(f'ArcGIS did not copy all selected new {branch.label.lower()}.')
+    arcpy.AddMessage(f'Copying the complete historical {dataset.label} target...')
+    arcpy.management.CopyFeatures(dataset.target_path, dataset.staged_target)
+    arcpy.management.CopyFeatures(dataset.new_input, copied_new)
+    if _count(copied_new) != dataset.new_count:
+        raise ValueError(f'ArcGIS did not copy all selected new {dataset.label} features.')
 
     # project the new records into the target coordinate system before appending
-    if _same_spatial_reference(branch.source_sr, branch.target_sr):
-        arcpy.management.CopyFeatures(copied_new, branch.staged_new)
+    if _same_spatial_reference(dataset.source_sr, dataset.target_sr):
+        arcpy.management.CopyFeatures(copied_new, dataset.staged_new)
     else:
         arcpy.AddMessage(
-            f'Projecting new {branch.label.lower()} to the target coordinate system...'
+            f'Projecting new {dataset.label} features to the target coordinate system...'
         )
         kwargs = {
             'in_dataset': copied_new,
-            'out_dataset': branch.staged_new,
-            'out_coor_system': branch.target_sr,
+            'out_dataset': dataset.staged_new,
+            'out_coor_system': dataset.target_sr,
         }
-        if branch.transformation:
-            kwargs['transform_method'] = branch.transformation
+        if dataset.transformation:
+            kwargs['transform_method'] = dataset.transformation
         arcpy.management.Project(**kwargs)
-    if _count(branch.staged_new) != branch.new_count:
-        raise ValueError(f'Projection changed the number of new {branch.label.lower()} features.')
-    nulls = _null_geometry_count(branch.staged_new)
+    if _count(dataset.staged_new) != dataset.new_count:
+        raise ValueError(
+            f'Projection changed the number of new {dataset.label} features.'
+        )
+    nulls = _null_geometry_count(dataset.staged_new)
     if nulls:
         raise ValueError(
-            f'Projection produced {nulls} empty {branch.label.lower()} geometries. '
+            f'Projection produced {nulls} empty {dataset.label} geometries. '
             'Run Check Geometry on the source data and try again.'
         )
     problem_table = os.path.join(gdb, f'{safe}_new_geometry_problems')
-    invalids, detail = _geometry_problems(branch.staged_new, problem_table)
+    invalids, detail = _geometry_problems(dataset.staged_new, problem_table)
     if invalids:
         raise ValueError(
             f'ArcGIS found {invalids} geometry problem(s) in the projected new '
-            f'{branch.label.lower()}. Repair the source geometry and run the tool again.'
+            f'{dataset.label} data. Repair the source geometry and run the tool again.'
             + (f' Reported: {detail}.' if detail else '')
         )
 
     # fill required fields, map them explicitly, and append to a copy of the target
-    _prepare_role_fields(branch)
-    mappings, mapped = _build_field_mappings(branch)
-    arcpy.management.CopyFeatures(branch.staged_target, branch.staged_output)
-    arcpy.AddMessage(f'Appending {branch.new_count:,} new {branch.label.lower()}...')
-    arcpy.management.Append(branch.staged_new, branch.staged_output, 'NO_TEST', mappings)
-    final_count = _count(branch.staged_output)
-    expected = branch.historical_count + branch.new_count
+    _prepare_role_fields(dataset)
+    mappings, mapped = _build_field_mappings(dataset)
+    arcpy.management.CopyFeatures(dataset.staged_target, dataset.staged_output)
+    arcpy.AddMessage(f'Appending {dataset.new_count:,} new {dataset.label} features...')
+    arcpy.management.Append(dataset.staged_new, dataset.staged_output, 'NO_TEST', mappings)
+    final_count = _count(dataset.staged_output)
+    expected = dataset.historical_count + dataset.new_count
     if final_count != expected:
         raise ValueError(
-            f'{branch.label} count check failed: expected {expected:,}, found '
+            f'{dataset.label} count check failed: expected {expected:,}, found '
             f'{final_count:,}. No release files were published.'
         )
-    if _null_geometry_count(branch.staged_output):
+    if _null_geometry_count(dataset.staged_output):
         raise ValueError(
-            f'The complete {branch.label.lower()} output contains empty geometry.'
+            f'The complete {dataset.label} output contains empty geometry.'
         )
     problem_table = os.path.join(gdb, f'{safe}_complete_geometry_problems')
-    invalids, detail = _geometry_problems(branch.staged_output, problem_table)
+    invalids, detail = _geometry_problems(dataset.staged_output, problem_table)
     if invalids:
         raise ValueError(
             f'ArcGIS found {invalids} geometry problem(s) after combining the '
-            f'{branch.label.lower()}. No release files were published.'
+            f'{dataset.label} data. No release files were published.'
             + (f' Reported: {detail}.' if detail else '')
         )
     output_sr = _valid_spatial_reference(
-        branch.staged_output, f'Complete {branch.label.lower()}'
+        dataset.staged_output, f'Complete {dataset.label}'
     )
-    if not _same_spatial_reference(output_sr, branch.target_sr):
+    if not _same_spatial_reference(output_sr, dataset.target_sr):
         raise ValueError(
-            f'The complete {branch.label.lower()} has the wrong coordinate system.'
+            f'The complete {dataset.label} data has the wrong coordinate system.'
         )
 
     # create the final shapefile in staging and verify that its schema survived
-    branch.staged_release = os.path.join(release_dir, branch.output_name)
-    arcpy.management.CopyFeatures(branch.staged_output, branch.staged_release)
-    release_count = _count(branch.staged_release)
+    dataset.staged_release = os.path.join(release_dir, dataset.output_name)
+    arcpy.management.CopyFeatures(dataset.staged_output, dataset.staged_release)
+    release_count = _count(dataset.staged_release)
     release_sr = _valid_spatial_reference(
-        branch.staged_release, f'Packaged {branch.label.lower()}'
+        dataset.staged_release, f'Packaged {dataset.label}'
     )
-    target_schema = _schema_signature(branch.target_path)
-    release_schema = _schema_signature(branch.staged_release)
+    target_schema = _schema_signature(dataset.target_path)
+    release_schema = _schema_signature(dataset.staged_release)
     if release_count != expected:
         raise ValueError(
-            f'Packaged {branch.label.lower()} count check failed: expected {expected:,}, '
+            f'Packaged {dataset.label} count check failed: expected {expected:,}, '
             f'found {release_count:,}.'
         )
-    if not _same_spatial_reference(release_sr, branch.target_sr):
-        raise ValueError(f'Packaged {branch.label.lower()} has the wrong coordinate system.')
+    if not _same_spatial_reference(release_sr, dataset.target_sr):
+        raise ValueError(f'Packaged {dataset.label} data has the wrong coordinate system.')
     if release_schema != target_schema:
         differences = _schema_differences(target_schema, release_schema)
         detail = '; '.join(differences) or 'no individual difference could be isolated'
         raise ValueError(
-            f'Packaged {branch.label.lower()} schema does not match its production '
+            f'Packaged {dataset.label} schema does not match its production '
             f'target: {detail}.'
         )
     problem_table = os.path.join(gdb, f'{safe}_release_geometry_problems')
-    invalids, detail = _geometry_problems(branch.staged_release, problem_table)
+    invalids, detail = _geometry_problems(dataset.staged_release, problem_table)
     if invalids:
         raise ValueError(
-            f'Packaged {branch.label.lower()} contains {invalids} geometry problem(s).'
+            f'Packaged {dataset.label} data contains {invalids} geometry problem(s).'
             + (f' Reported: {detail}.' if detail else '')
         )
     qa_rows.extend([
-        _qa(branch.label, 'target_input_path', 'PASS', branch.target_path,
+        _qa(dataset.label, 'target_input_path', 'PASS', dataset.target_path,
             'Complete historical target; layer selections were ignored.'),
-        _qa(branch.label, 'new_input_path', 'PASS',
-            str(getattr(arcpy.Describe(branch.new_input), 'catalogPath', branch.new_input)),
+        _qa(dataset.label, 'new_input_path', 'PASS',
+            str(getattr(arcpy.Describe(dataset.new_input), 'catalogPath', dataset.new_input)),
             'Selections and definition queries on this layer were honored.'),
         _qa(
-            branch.label,
+            dataset.label,
             'historical_count',
             'PASS',
-            branch.historical_count,
-            branch.target_path,
+            dataset.historical_count,
+            dataset.target_path,
         ),
-        _qa(branch.label, 'new_count', 'PASS', branch.new_count,
+        _qa(dataset.label, 'new_count', 'PASS', dataset.new_count,
             'Selections and definition queries on the new layer were honored.'),
-        _qa(branch.label, 'final_count', 'PASS', final_count, f'Expected {expected}.'),
-        _qa(branch.label, 'target_spatial_reference', 'PASS',
-            getattr(branch.target_sr, 'name', ''), ''),
-        _qa(branch.label, 'geographic_transformation', 'PASS',
-            branch.transformation or 'None required', ''),
-        _qa(branch.label, 'field_mapping', 'PASS', '; '.join(mapped), ''),
-        _qa(branch.label, 'packaged_schema', 'PASS',
+        _qa(dataset.label, 'final_count', 'PASS', final_count, f'Expected {expected}.'),
+        _qa(dataset.label, 'target_spatial_reference', 'PASS',
+            getattr(dataset.target_sr, 'name', ''), ''),
+        _qa(dataset.label, 'geographic_transformation', 'PASS',
+            dataset.transformation or 'None required', ''),
+        _qa(dataset.label, 'field_mapping', 'PASS', '; '.join(mapped), ''),
+        _qa(dataset.label, 'packaged_schema', 'PASS',
             '; '.join(item[0] for item in release_schema),
             'Matches the selected production target.'),
+        _qa(dataset.label, 'enforced_roles', 'PASS',
+            ', '.join(dataset.roles) or 'none',
+            'Required roles that exist on the production target.'),
     ])
-    for role, count in branch.filled_counts.items():
-        qa_rows.append(_qa(branch.label, f'{role}_fallback_rows', 'PASS', count, ''))
+    for role, count in dataset.filled_counts.items():
+        qa_rows.append(_qa(dataset.label, f'{role}_fallback_rows', 'PASS', count, ''))
         qa_rows.append(
             _qa(
-                branch.label,
+                dataset.label,
                 f'{role}_missing_rows',
                 'PASS',
                 0,
                 'Validated on every selected new feature.',
             )
         )
-    if 'rotation' in branch.source_role_fields:
+    if 'rotation' in dataset.source_role_fields:
         rotations = []
         with arcpy.da.SearchCursor(
-            branch.staged_new, [branch.source_role_fields['rotation']]
+            dataset.staged_new, [dataset.source_role_fields['rotation']]
         ) as rows:
             rotations = [float(value) for (value,) in rows]
         qa_rows.extend([
-            _qa(branch.label, 'rotation_minimum', 'PASS', min(rotations),
-                'Selected new arrowheads.'),
-            _qa(branch.label, 'rotation_maximum', 'PASS', max(rotations),
-                'Selected new arrowheads.'),
+            _qa(dataset.label, 'rotation_minimum', 'PASS', min(rotations),
+                'Selected new features.'),
+            _qa(dataset.label, 'rotation_maximum', 'PASS', max(rotations),
+                'Selected new features.'),
         ])
 
 
@@ -824,7 +889,7 @@ def _qa(section, check, status, value, details):
 
 
 def _write_zip(staged_shapefile: str, zip_path: str) -> List[str]:
-    '''write the line shapefile and its required sidecars to a ZIP'''
+    '''write a shapefile and its required sidecars to a ZIP'''
 
     base = os.path.splitext(staged_shapefile)[0]
     members = core.select_shapefile_zip_members(
@@ -834,6 +899,79 @@ def _write_zip(staged_shapefile: str, zip_path: str) -> List[str]:
         for path in members:
             archive.write(path, os.path.basename(path))
     return [os.path.basename(path) for path in members]
+
+
+def _write_geojson(dataset: _Dataset, shapefile: str, geojson_path: str) -> None:
+    '''write the WGS 84 GeoJSON Mapbox uses and confirm its feature count'''
+
+    arcpy.AddMessage(f'Creating formatted WGS 84 GeoJSON for {dataset.label}...')
+    arcpy.conversion.FeaturesToJSON(
+        shapefile,
+        geojson_path,
+        'FORMATTED',
+        'NO_Z_VALUES',
+        'NO_M_VALUES',
+        'GEOJSON',
+        'WGS84',
+        'USE_FIELD_NAME',
+    )
+    if not os.path.isfile(geojson_path) or os.path.getsize(geojson_path) == 0:
+        raise ValueError(f'ArcGIS did not create a valid GeoJSON file for {dataset.label}.')
+    try:
+        with open(geojson_path, encoding='utf-8') as stream:
+            geojson = json.load(stream)
+    except (OSError, ValueError) as error:
+        raise ValueError(f'GeoJSON for {dataset.label} could not be read: {error}') from None
+    expected = dataset.historical_count + dataset.new_count
+    if (
+        geojson.get('type') != 'FeatureCollection'
+        or len(geojson.get('features', [])) != expected
+    ):
+        raise ValueError(
+            f'GeoJSON validation failed for {dataset.label}: its feature count does not '
+            'match the complete release.'
+        )
+
+
+def _package_dataset(
+    dataset: _Dataset,
+    release_dir: str,
+    qa_rows: List[core.QARow],
+) -> List[str]:
+    '''collect the shapefile package and optional ZIP or GeoJSON for one dataset'''
+
+    staged = dataset.staged_release
+    sources = list(core.select_shapefile_zip_members(
+        glob.glob(os.path.splitext(staged)[0] + '.*'),
+        os.path.basename(staged),
+    ))
+    if 'zip' in dataset.package_formats:
+        staged_zip = os.path.join(release_dir, os.path.basename(dataset.zip_path))
+        members = _write_zip(staged, staged_zip)
+        sources.append(staged_zip)
+        qa_rows.append(
+            _qa(
+                dataset.label,
+                'zip_members',
+                'PASS',
+                '; '.join(members),
+                'Files are stored at the ZIP root.',
+            )
+        )
+    if 'geojson' in dataset.package_formats:
+        staged_geojson = os.path.join(release_dir, os.path.basename(dataset.geojson_path))
+        _write_geojson(dataset, staged, staged_geojson)
+        sources.append(staged_geojson)
+        qa_rows.append(
+            _qa(
+                dataset.label,
+                'geojson',
+                'PASS',
+                f'WGS 84 / field names / {dataset.historical_count + dataset.new_count} features',
+                os.path.basename(staged_geojson),
+            )
+        )
+    return sources
 
 
 def _write_qa(path: str, rows: Iterable[core.QARow]) -> None:
@@ -866,106 +1004,63 @@ def _copy_release_artifacts(sources: Sequence[str], output_folder: str) -> List[
     return created
 
 
-def _as_boolean(value, label: str) -> bool:
-    '''normalize ArcPy booleans without treating the text false as true'''
-
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int) and value in (0, 1):
-        return bool(value)
-    text = str(value or '').strip().casefold()
-    if text in ('true', '1', 'yes'):
-        return True
-    if text in ('false', '0', 'no', ''):
-        return False
-    raise ValueError(f'{label} must be True or False.')
-
-
 def execute(
-    process_lines,
-    line_target,
-    new_lines,
-    line_transformation,
-    process_points,
-    point_target,
-    new_points,
-    point_transformation,
+    datasets,
     herd_name,
     country,
-    season,
-    line_class,
-    point_type,
     release_date,
     output_folder,
 ):
-    '''build and safely publish a complete GIUM arrow release'''
+    '''build and safely publish a complete GIUM release from one or more datasets'''
 
-    # normalize ArcGIS parameter values and calculate the dated output paths
-    process_lines = _as_boolean(process_lines, 'Process seasonal arrow lines')
-    process_points = _as_boolean(process_points, 'Process arrowhead points')
-    if not process_lines and not process_points:
-        raise ValueError(
-            'Select at least one section: seasonal arrow lines or arrowhead points.'
-        )
+    rows = core.parse_dataset_rows(datasets)
+    if not rows:
+        raise ValueError('Add at least one dataset to the table.')
     output_folder = _validate_output_folder(output_folder)
-    stamp = core.release_stamp(release_date)
-    result = _artifact_paths(output_folder, release_date, process_lines, process_points)
-    _assert_no_collisions(result)
-
-    # keep the shared fallback values together for both enabled branches
-    branches = []
-    shared = {
-        'herd': herd_name,
-        'country': country,
-        'season': season,
-        'class': line_class,
-        'type': point_type or 'Arrowhead',
-    }
-    if process_lines:
-        if not line_target or not new_lines:
-            raise ValueError(
-                'Choose both the existing SeasonalArrows target and new arrow lines.'
-            )
-        branches.append(
-            _Branch(
-                'Seasonal arrow lines',
-                'Polyline',
-                line_target,
-                new_lines,
-                line_transformation or '',
-                _LINE_ROLES,
-                core.LINE_ROLE_PROFILE,
-                shared,
-                os.path.basename(result.line_output),
-            )
-        )
-    if process_points:
-        if not point_target or not new_points:
-            raise ValueError(
-                'Choose both the existing GIUMPointLabels target and new arrowheads.'
-            )
-        branches.append(
-            _Branch(
-                'Arrowhead points',
-                'Point',
-                point_target,
-                new_points,
-                point_transformation or '',
-                _POINT_ROLES,
-                core.POINT_ROLE_PROFILE,
-                shared,
-                os.path.basename(result.point_output),
+    items = []
+    for index, row in enumerate(rows, start=1):
+        profile = core.layer_profile(row['layer_type'])
+        items.append(
+            _Dataset(
+                index=index,
+                profile=profile,
+                label=f'Row {index} {profile.name}',
+                shape_type=profile.shape_type or '',
+                target_input=row['target'],
+                new_input=row['new_data'],
+                requested_transformation=str(row.get('transformation') or '').strip(),
+                package_choice=row.get('package'),
+                package_formats=core.resolve_package_formats(row.get('package'), profile),
+                fallbacks={
+                    'herd': herd_name,
+                    'country': country,
+                    'class': row.get('class'),
+                    'type': row.get('type'),
+                    'season': row.get('season'),
+                },
             )
         )
 
     # all checks above and below this point are read-only
     arcpy.AddMessage('Checking inputs before creating release files...')
-    for branch in branches:
-        _validate_branch(branch)
+    for item in items:
+        _validate_dataset(item)
+        _assign_artifact_paths(item, output_folder, release_date)
+
+    folded_names = [item.output_name.casefold() for item in items]
+    if len(folded_names) != len(set(folded_names)):
+        raise ValueError(
+            'Two datasets in this run would create the same output filename. '
+            'Choose a different layer type, or run them as separate releases.'
+        )
+
+    qa_csv = core.qa_report_path(output_folder, release_date)
+    planned = _planned_paths(items, qa_csv)
+    _assert_no_collisions(planned)
 
     missing_values = []
-    for branch in branches:
-        missing_values.extend(_missing_required_values(branch))
+    for item in items:
+        missing_values.extend(_missing_required_values(item))
     if missing_values:
         raise ValueError(
             'Required GIUM values are missing. Enter the value in the tool to fill '
@@ -974,28 +1069,28 @@ def execute(
         )
 
     # make sure an unusual output path cannot replace an input
-    final_paths = [path for path in vars(result).values() if path]
-    source_paths = [branch.target_path for branch in branches]
+    source_paths = [item.target_path for item in items]
     source_paths += [
         str(
             getattr(
-                arcpy.Describe(branch.new_input),
+                arcpy.Describe(item.new_input),
                 'catalogPath',
-                branch.new_input,
+                item.new_input,
             )
         )
-        for branch in branches
+        for item in items
     ]
-    if {_normalized_path(path) for path in final_paths} & {
+    if {_normalized_path(path) for path in planned} & {
         _normalized_path(path) for path in source_paths
     }:
         raise ValueError('A release output path cannot replace an input dataset.')
 
-    # create temporary staging only after every enabled branch passes preflight
+    # create temporary staging only after every dataset passes preflight
     output_folder = _validate_output_folder(output_folder, create=True)
     staging_root = tempfile.mkdtemp(prefix='.gium_arrow_staging_', dir=output_folder)
     release_dir = os.path.join(staging_root, 'release')
     os.mkdir(release_dir)
+    stamp = core.release_stamp(release_date)
     qa_rows = [
         _qa('Release', 'release_date', 'PASS', stamp, ''),
         _qa(
@@ -1003,7 +1098,7 @@ def execute(
             'atomic_mode',
             'PASS',
             'Enabled',
-            'All enabled sections must pass before files are published.',
+            'All datasets must pass before files are published.',
         ),
     ]
     published = []
@@ -1016,96 +1111,33 @@ def execute(
         except (TypeError, IndexError, KeyError):
             gdb = os.path.join(staging_root, 'staging.gdb')
 
-        for branch in branches:
-            _stage_branch(branch, gdb, release_dir, qa_rows)
+        for item in items:
+            _stage_dataset(item, gdb, release_dir, qa_rows)
 
-        # collect complete shapefile sidecars and build the line ZIP
         promotion_sources = []
-        if process_lines:
-            staged_line = os.path.join(release_dir, os.path.basename(result.line_output))
-            staged_zip = os.path.join(release_dir, os.path.basename(result.line_zip))
-            members = _write_zip(staged_line, staged_zip)
-            promotion_sources.extend(core.select_shapefile_zip_members(
-                glob.glob(os.path.splitext(staged_line)[0] + '.*'),
-                os.path.basename(staged_line),
-            ))
-            promotion_sources.append(staged_zip)
+        for item in items:
+            promotion_sources.extend(_package_dataset(item, release_dir, qa_rows))
+
+        result = IntegrationResult(
+            created=[
+                path
+                for item in items
+                for path in (item.shapefile_path, item.zip_path, item.geojson_path)
+                if path
+            ],
+            qa_csv=qa_csv,
+        )
+        staged_qa = os.path.join(release_dir, os.path.basename(qa_csv))
+        for path in result.created + [result.qa_csv]:
             qa_rows.append(
                 _qa(
-                    'Seasonal arrow lines',
-                    'zip_members',
+                    'Release',
+                    'artifact_path',
                     'PASS',
-                    '; '.join(members),
-                    'Files are stored at the ZIP root.',
+                    path,
+                    'Final release artifact.',
                 )
             )
-
-        # convert the complete point release to the WGS 84 GeoJSON used downstream
-        if process_points:
-            staged_points = os.path.join(
-                release_dir, os.path.basename(result.point_output)
-            )
-            staged_geojson = os.path.join(
-                release_dir, os.path.basename(result.point_geojson)
-            )
-            arcpy.AddMessage('Creating formatted WGS 84 GeoJSON for Mapbox...')
-            arcpy.conversion.FeaturesToJSON(
-                staged_points,
-                staged_geojson,
-                'FORMATTED',
-                'NO_Z_VALUES',
-                'NO_M_VALUES',
-                'GEOJSON',
-                'WGS84',
-                'USE_FIELD_NAME',
-            )
-            if not os.path.isfile(staged_geojson) or os.path.getsize(staged_geojson) == 0:
-                raise ValueError('ArcGIS did not create a valid point-label GeoJSON file.')
-            try:
-                with open(staged_geojson, encoding='utf-8') as stream:
-                    geojson = json.load(stream)
-            except (OSError, ValueError) as error:
-                raise ValueError(f'Point-label GeoJSON could not be read: {error}') from None
-            expected_points = next(
-                branch.historical_count + branch.new_count
-                for branch in branches if branch.shape_type == 'Point'
-            )
-            if (
-                geojson.get('type') != 'FeatureCollection'
-                or len(geojson.get('features', [])) != expected_points
-            ):
-                raise ValueError(
-                    'Point-label GeoJSON validation failed: its feature count does not '
-                    'match the complete point-label release.'
-                )
-            qa_rows.append(
-                _qa(
-                    'Arrowhead points',
-                    'geojson',
-                    'PASS',
-                    f'WGS 84 / field names / {expected_points} features',
-                    os.path.basename(staged_geojson),
-                )
-            )
-            promotion_sources.extend(core.select_shapefile_zip_members(
-                glob.glob(os.path.splitext(staged_points)[0] + '.*'),
-                os.path.basename(staged_points),
-            ))
-            promotion_sources.append(staged_geojson)
-
-        # write the QA report last so it describes every artifact being published
-        staged_qa = os.path.join(release_dir, os.path.basename(result.qa_csv))
-        for artifact_name, artifact_path in vars(result).items():
-            if artifact_path:
-                qa_rows.append(
-                    _qa(
-                        'Release',
-                        f'{artifact_name}_path',
-                        'PASS',
-                        artifact_path,
-                        'Final release artifact.',
-                    )
-                )
         qa_rows.append(
             _qa(
                 'Release',
@@ -1118,20 +1150,13 @@ def execute(
         _write_qa(staged_qa, qa_rows)
         promotion_sources.append(staged_qa)
         published = _copy_release_artifacts(promotion_sources, output_folder)
-        arcpy.AddMessage('GIUM arrow release created successfully.')
-        for path in (
-            result.line_output,
-            result.line_zip,
-            result.point_output,
-            result.point_geojson,
-            result.qa_csv,
-        ):
-            if path:
-                arcpy.AddMessage(f'Created: {path}')
+        arcpy.AddMessage('GIUM release created successfully.')
+        for path in result.created + [result.qa_csv]:
+            arcpy.AddMessage(f'Created: {path}')
         arcpy.AddMessage(
             'Next step: complete visual review before publishing to Mapbox. Compare the '
-            'old and new layers in ArcGIS Pro and confirm arrow placement, rotation, '
-            'herd, season, class, and type.'
+            'old and new layers in ArcGIS Pro and confirm placement, attributes, and '
+            'feature counts.'
         )
         return result
     except Exception:

@@ -13,21 +13,31 @@ sys.path.insert(0, str(PACKAGE))
 
 from gium_integration_core import (  # noqa: E402
     FieldDefinition,
-    LINE_ROLE_PROFILE,
-    POINT_ROLE_PROFILE,
+    LAYER_PROFILE_NAMES,
+    PACKAGE_BOTH,
+    PACKAGE_CHOICES,
+    PACKAGE_GEOJSON,
+    PACKAGE_ZIP,
     QA_COLUMNS,
     QARow,
     coalesce_value,
+    dataset_base_name,
     ensure_no_artifact_collisions,
     field_definition,
     find_artifact_collisions,
     is_blank,
+    layer_profile,
+    parse_dataset_row,
+    parse_dataset_rows,
     qa_csv_text,
+    qa_report_name,
     release_artifact_names,
     release_artifact_paths,
+    resolve_package_formats,
     resolve_role_fields,
     resolved_role_value,
     select_shapefile_zip_members,
+    strip_release_stamp,
     validate_required_value,
     validate_required_values,
     validate_role_field,
@@ -40,6 +50,14 @@ def text_field(name, length=80):
     return FieldDefinition(name, "String", length)
 
 
+def arrows():
+    return layer_profile("Seasonal arrows")
+
+
+def points():
+    return layer_profile("GIUM point labels")
+
+
 class RoleResolutionTests(unittest.TestCase):
     def test_line_roles_resolve_case_insensitively(self):
         resolved = resolve_role_fields(
@@ -49,7 +67,7 @@ class RoleResolutionTests(unittest.TestCase):
                 text_field("SEASON"),
                 text_field("CLASS"),
             ],
-            LINE_ROLE_PROFILE,
+            arrows(),
         )
         self.assertEqual(resolved["herd"].name, "HERD_NAME")
         self.assertEqual(resolved["country"].name, "country")
@@ -64,25 +82,25 @@ class RoleResolutionTests(unittest.TestCase):
                 text_field("TYPE"),
                 FieldDefinition("Rotation", "Double"),
             ],
-            POINT_ROLE_PROFILE,
+            points(),
         )
         self.assertIsNone(resolved["country"])
 
     def test_source_can_have_no_known_fields_when_required_roles_disabled(self):
         resolved = resolve_role_fields(
-            [text_field("Unrelated")], POINT_ROLE_PROFILE, require_profile_roles=False
+            [text_field("Unrelated")], points(), require_profile_roles=False
         )
         self.assertTrue(all(field is None for field in resolved.values()))
 
     def test_missing_required_target_role_fails_with_aliases(self):
-        with self.assertRaisesRegex(ValueError, "required class.*class, Class"):
+        with self.assertRaisesRegex(ValueError, "required class.*Class, class"):
             resolve_role_fields(
                 [
                     text_field("HerdName"),
                     text_field("Country"),
                     text_field("Season"),
                 ],
-                LINE_ROLE_PROFILE,
+                arrows(),
             )
 
     def test_two_accepted_aliases_are_ambiguous(self):
@@ -95,14 +113,14 @@ class RoleResolutionTests(unittest.TestCase):
                     text_field("Season"),
                     text_field("Class"),
                 ],
-                LINE_ROLE_PROFILE,
+                arrows(),
             )
 
     def test_case_only_duplicate_is_ambiguous(self):
         with self.assertRaisesRegex(ValueError, "Ambiguous.*type"):
             resolve_role_fields(
                 [text_field("Type"), text_field("TYPE")],
-                POINT_ROLE_PROFILE,
+                points(),
                 require_profile_roles=False,
             )
 
@@ -202,40 +220,126 @@ class MetadataPolicyTests(unittest.TestCase):
             resolved_role_value("rotation", None, 360, field)
 
 
+class LayerProfileTests(unittest.TestCase):
+    def test_registry_covers_the_gium_layer_types(self):
+        self.assertEqual(
+            LAYER_PROFILE_NAMES,
+            (
+                "Seasonal arrows",
+                "GIUM point labels",
+                "Linear barriers",
+                "Point barriers",
+                "Polygon features",
+                "Protected areas",
+                "Line labels",
+                "Other",
+            ),
+        )
+        self.assertEqual(layer_profile("seasonal arrows").output_base, "SeasonalArrowsMerged")
+        self.assertEqual(layer_profile("Protected areas").shape_type, "Polygon")
+        self.assertIsNone(layer_profile("Other").shape_type)
+        with self.assertRaisesRegex(ValueError, "Unknown layer type"):
+            layer_profile("Not a layer")
+
+    def test_blank_package_keeps_the_profile_default(self):
+        self.assertEqual(resolve_package_formats("", arrows()), ("zip",))
+        self.assertEqual(
+            resolve_package_formats(None, points()), ("geojson",)
+        )
+        self.assertEqual(resolve_package_formats(PACKAGE_BOTH, arrows()), ("zip", "geojson"))
+        self.assertEqual(PACKAGE_CHOICES, (PACKAGE_ZIP, PACKAGE_GEOJSON, PACKAGE_BOTH))
+
+    def test_pass_through_roles_are_not_type_constrained(self):
+        field = FieldDefinition("Migrate_ID", "Integer")
+        self.assertEqual(validate_role_field("migrate_id", field).type, "Integer")
+
+    def test_parse_dataset_row_accepts_lists_and_dicts(self):
+        parsed = parse_dataset_row(
+            ["Seasonal arrows", "old.shp", "new.shp", "Migration"],
+            1,
+        )
+        self.assertEqual(parsed["layer_type"], "Seasonal arrows")
+        self.assertEqual(parsed["class"], "Migration")
+        self.assertIsNone(parsed["package"])
+        named = parse_dataset_row(
+            {"layer_type": "Other", "target": "a.shp", "new_data": "b.shp"},
+            2,
+        )
+        self.assertEqual(named["target"], "a.shp")
+        with self.assertRaisesRegex(ValueError, "Row 3 needs a layer type"):
+            parse_dataset_row(["", "a.shp", "b.shp"], 3)
+        self.assertEqual(parse_dataset_rows(None), [])
+
+
 class ReleaseArtifactTests(unittest.TestCase):
     def test_names_use_merged_month_day_year_stamps(self):
-        expected = (
-            "SeasonalArrowsMerged_April9_2026.shp",
-            "SeasonalArrowsMerged_April9_2026.zip",
-            "GIUMPointLabelsMerged_April9_2026.shp",
-            "GIUMPointLabelsMerged_April9_2026.geojson",
-            "GIUMArrowIntegration_April9_2026_QA.csv",
-        )
-        self.assertEqual(release_artifact_names(datetime.date(2026, 4, 9)).all(), expected)
-        self.assertEqual(release_artifact_names("2026-04-09").all(), expected)
-        self.assertEqual(release_artifact_names("20260409").all(), expected)
+        date = datetime.date(2026, 4, 9)
+        line_names = release_artifact_names(arrows(), date)
+        point_names = release_artifact_names(points(), date)
         self.assertEqual(
-            release_artifact_names(datetime.date(2026, 6, 10)).point_shapefile,
-            "GIUMPointLabelsMerged_June10_2026.shp",
+            line_names.all(),
+            (
+                "SeasonalArrowsMerged_April9_2026.shp",
+                "SeasonalArrowsMerged_April9_2026.zip",
+            ),
+        )
+        self.assertEqual(
+            point_names.all(),
+            (
+                "GIUMPointLabelsMerged_April9_2026.shp",
+                "GIUMPointLabelsMerged_April9_2026.geojson",
+            ),
+        )
+        self.assertEqual(
+            release_artifact_names(arrows(), "2026-04-09").shapefile,
+            "SeasonalArrowsMerged_April9_2026.shp",
+        )
+        self.assertEqual(
+            release_artifact_names(points(), "20260409").geojson,
+            "GIUMPointLabelsMerged_April9_2026.geojson",
+        )
+        self.assertEqual(
+            qa_report_name(datetime.date(2026, 6, 10)),
+            "GIUMIntegration_June10_2026_QA.csv",
+        )
+        self.assertEqual(
+            dataset_base_name(layer_profile("Linear barriers"), date),
+            "linear_barriers_April9_2026",
+        )
+
+    def test_other_and_line_labels_are_named_after_the_target(self):
+        date = datetime.date(2026, 8, 4)
+        self.assertEqual(
+            strip_release_stamp("LineLabels_June10_2026.shp"),
+            "LineLabels",
+        )
+        self.assertEqual(
+            dataset_base_name(layer_profile("Line labels"), date, "LineLabels_June10_2026.shp"),
+            "LineLabels_August4_2026",
+        )
+        self.assertEqual(
+            dataset_base_name(layer_profile("Other"), date, r"C:\data\custom_layer.shp"),
+            "custom_layer_August4_2026",
         )
 
     def test_invalid_calendar_date_or_format_fails(self):
         for value in ("2026-02-30", "04/09/2026", "", None):
             with self.assertRaisesRegex(ValueError, "Release date"):
-                release_artifact_names(value)
+                release_artifact_names(arrows(), value)
 
     def test_paths_join_to_selected_folder(self):
-        paths = release_artifact_paths("/release folder", "20260409")
+        line_paths = release_artifact_paths("/release folder", arrows(), "20260409")
+        point_paths = release_artifact_paths("/release folder", points(), "20260409")
         self.assertEqual(
-            paths["line_zip"],
+            line_paths["zip"],
             os.path.join("/release folder", "SeasonalArrowsMerged_April9_2026.zip"),
         )
         self.assertEqual(
-            paths["point_geojson"],
+            point_paths["geojson"],
             os.path.join("/release folder", "GIUMPointLabelsMerged_April9_2026.geojson"),
         )
         with self.assertRaisesRegex(ValueError, "Output folder"):
-            release_artifact_paths(" ", "20260409")
+            release_artifact_paths(" ", arrows(), "20260409")
 
     def test_collision_helpers_do_not_write_or_normalize_paths(self):
         existing = {"A/SeasonalArrows.shp", "A/report.csv"}

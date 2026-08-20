@@ -1,5 +1,5 @@
 '''
-pure python policy and validation for the GIUM arrow integration workflow
+pure python policy and validation for the GIUM data integration workflow
 
 I intentionally didnt include an arcpy dependency so the GIUM field rules,
 release names, and package checks can be tested in any Python runtime.
@@ -12,9 +12,10 @@ import datetime as _datetime
 import io
 import math
 import os
+import re
 from dataclasses import dataclass
 from numbers import Integral, Real
-from typing import Callable, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 
 TEXT_FIELD_TYPES = frozenset({'String'})
@@ -33,59 +34,258 @@ class FieldDefinition:
     length: Optional[int] = None
 
 
+# the accepted spellings for every role the tool understands. matching ignores
+# case, but the variants seen in production are kept visible because they are
+# what the operator sees in the "accepted names" half of an error message.
+ROLE_ALIASES: Dict[str, Tuple[str, ...]] = {
+    'herd': ('Herd_Name', 'HerdName'),
+    'country': ('Country',),
+    'season': ('Season',),
+    'class': ('Class', 'class'),
+    'type': ('Type', 'type'),
+    'rotation': ('Rotation',),
+    'source': ('Source',),
+    'locale': ('Locale',),
+    'migrate_id': ('Migrate_ID', 'MigrateID'),
+}
+
+# roles the tool fills from a value typed into the form, so their target field
+# has to hold that kind of value. every other role is only ever carried across
+# from the new data, so its field type is whatever production already uses.
+TEXT_ROLES = frozenset({'herd', 'country', 'season', 'class', 'type'})
+NUMERIC_ROLES = frozenset({'rotation'})
+
+PACKAGE_ZIP = 'Zipped shapefile'
+PACKAGE_GEOJSON = 'GeoJSON'
+PACKAGE_BOTH = 'Both'
+PACKAGE_CHOICES = (PACKAGE_ZIP, PACKAGE_GEOJSON, PACKAGE_BOTH)
+SUPPORTED_SHAPE_TYPES = ('Point', 'Polyline', 'Polygon')
+
+_PACKAGE_FORMATS: Dict[str, Tuple[str, ...]] = {
+    PACKAGE_ZIP.casefold(): ('zip',),
+    PACKAGE_GEOJSON.casefold(): ('geojson',),
+    PACKAGE_BOTH.casefold(): ('zip', 'geojson'),
+}
+
+# the columns of the datasets value table, in the order the tool form shows them
+DATASET_COLUMNS = (
+    'layer_type',
+    'target',
+    'new_data',
+    'class',
+    'type',
+    'season',
+    'package',
+    'transformation',
+)
+
+
 @dataclass(frozen=True)
-class RoleProfile:
-    '''accepted field aliases and required roles for one GIUM layer'''
+class LayerProfile:
+    '''field rules, output naming, and packaging for one kind of GIUM layer
+
+    shape_type of None accepts any supported geometry, and output_base of None
+    means the release is named after the chosen production target.
+    '''
 
     name: str
+    shape_type: Optional[str]
     aliases: Mapping[str, Tuple[str, ...]]
     required_roles: Tuple[str, ...]
+    output_base: Optional[str]
+    default_package: str
 
 
-# keep the aliases from the GIUM instructions visible even though matching ignores case
-LINE_ROLE_PROFILE = RoleProfile(
-    name='seasonal arrow lines',
-    aliases={
-        'herd': ('HerdName', 'Herd_Name'),
-        'country': ('Country',),
-        'season': ('Season',),
-        'class': ('class', 'Class'),
-    },
-    required_roles=('herd', 'country', 'season', 'class'),
+def _role_aliases(*roles: str) -> Dict[str, Tuple[str, ...]]:
+    '''take the shared alias spellings for the roles one layer type uses'''
+
+    return {role: ROLE_ALIASES[role] for role in roles}
+
+
+OTHER_PROFILE_NAME = 'Other'
+
+LAYER_PROFILES: Tuple[LayerProfile, ...] = (
+    LayerProfile(
+        name='Seasonal arrows',
+        shape_type='Polyline',
+        aliases=_role_aliases('herd', 'country', 'season', 'class'),
+        required_roles=('herd', 'country', 'season', 'class'),
+        output_base='SeasonalArrowsMerged',
+        default_package=PACKAGE_ZIP,
+    ),
+    LayerProfile(
+        name='GIUM point labels',
+        shape_type='Point',
+        aliases=_role_aliases('herd', 'country', 'season', 'type', 'rotation'),
+        required_roles=('herd', 'season', 'type', 'rotation'),
+        output_base='GIUMPointLabelsMerged',
+        default_package=PACKAGE_GEOJSON,
+    ),
+    LayerProfile(
+        name='Linear barriers',
+        shape_type='Polyline',
+        aliases=_role_aliases(
+            'class', 'herd', 'country', 'source', 'locale', 'migrate_id'
+        ),
+        required_roles=('class', 'herd', 'country'),
+        output_base='linear_barriers',
+        default_package=PACKAGE_ZIP,
+    ),
+    LayerProfile(
+        name='Point barriers',
+        shape_type='Point',
+        aliases=_role_aliases(
+            'class', 'herd', 'country', 'source', 'locale', 'migrate_id'
+        ),
+        required_roles=('class', 'herd', 'country'),
+        output_base='point_barriers',
+        default_package=PACKAGE_ZIP,
+    ),
+    LayerProfile(
+        name='Polygon features',
+        shape_type='Polygon',
+        aliases=_role_aliases(
+            'class', 'herd', 'country', 'type', 'source', 'locale', 'migrate_id'
+        ),
+        required_roles=('class', 'herd', 'country'),
+        output_base='poly_features',
+        default_package=PACKAGE_ZIP,
+    ),
+    LayerProfile(
+        name='Protected areas',
+        shape_type='Polygon',
+        aliases=_role_aliases('type', 'herd', 'country'),
+        required_roles=('type', 'herd'),
+        output_base='ProtectedAreas',
+        default_package=PACKAGE_ZIP,
+    ),
+    LayerProfile(
+        name='Line labels',
+        shape_type='Polyline',
+        aliases=_role_aliases('herd', 'country', 'season', 'type', 'class'),
+        required_roles=('herd',),
+        output_base=None,
+        default_package=PACKAGE_ZIP,
+    ),
+    LayerProfile(
+        name=OTHER_PROFILE_NAME,
+        shape_type=None,
+        aliases=_role_aliases(*ROLE_ALIASES),
+        required_roles=(),
+        output_base=None,
+        default_package=PACKAGE_ZIP,
+    ),
 )
 
-POINT_ROLE_PROFILE = RoleProfile(
-    name='GIUM point labels',
-    aliases={
-        'herd': ('Herd_Name', 'HerdName'),
-        'country': ('Country',),
-        'season': ('Season',),
-        'type': ('Type', 'TYPE'),
-        'rotation': ('Rotation',),
-    },
-    required_roles=('herd', 'season', 'type', 'rotation'),
+LAYER_PROFILE_NAMES: Tuple[str, ...] = tuple(
+    profile.name for profile in LAYER_PROFILES
 )
+
+_LAYER_PROFILES_BY_NAME = {
+    profile.name.casefold(): profile for profile in LAYER_PROFILES
+}
+
+
+def layer_profile(name: object) -> LayerProfile:
+    '''look up one layer type without depending on capitalization'''
+
+    key = str(name or '').strip().casefold()
+    profile = _LAYER_PROFILES_BY_NAME.get(key)
+    if profile is None:
+        raise ValueError(
+            f'Unknown layer type {str(name or "").strip()!r}. Choose one of: '
+            + ', '.join(LAYER_PROFILE_NAMES)
+        )
+    return profile
+
+
+def resolve_package_formats(package: object, profile: LayerProfile) -> Tuple[str, ...]:
+    '''turn the packaging choice into the formats to write for one dataset
+
+    a blank choice keeps the default the GIUM instructions use for that layer.
+    '''
+
+    requested = str(package or '').strip()
+    if not requested:
+        requested = profile.default_package
+    formats = _PACKAGE_FORMATS.get(requested.casefold())
+    if formats is None:
+        raise ValueError(
+            f'Unknown package format {requested!r}. Choose one of: '
+            + ', '.join(PACKAGE_CHOICES)
+        )
+    return formats
+
+
+def parse_dataset_row(row: object, index: int = 1) -> Dict[str, object]:
+    '''normalize one datasets-table row into the named columns'''
+
+    if isinstance(row, Mapping):
+        values = {column: row.get(column) for column in DATASET_COLUMNS}
+    else:
+        try:
+            items = list(row)
+        except TypeError:
+            raise ValueError(f'Row {index} is not a valid datasets-table row.') from None
+        if len(items) < 3:
+            raise ValueError(
+                f'Row {index} is missing layer type, target, or new data.'
+            )
+        while len(items) < len(DATASET_COLUMNS):
+            items.append(None)
+        values = dict(zip(DATASET_COLUMNS, items[: len(DATASET_COLUMNS)]))
+    if is_blank(values.get('layer_type')):
+        raise ValueError(f'Row {index} needs a layer type.')
+    if is_blank(values.get('target')):
+        raise ValueError(f'Row {index} needs an existing production shapefile.')
+    if is_blank(values.get('new_data')):
+        raise ValueError(f'Row {index} needs the new data to add.')
+    return values
+
+
+def parse_dataset_rows(datasets: object) -> List[Dict[str, object]]:
+    '''normalize every datasets-table row, or an empty list when none were given'''
+
+    if not datasets:
+        return []
+    return [
+        parse_dataset_row(row, index) for index, row in enumerate(datasets, start=1)
+    ]
+
+
+def present_roles(
+    resolved: Mapping[str, Optional[FieldDefinition]],
+) -> Tuple[str, ...]:
+    '''return the profile roles that actually exist on a dataset'''
+
+    return tuple(role for role, field in resolved.items() if field is not None)
+
+
+def enforced_roles(
+    profile: LayerProfile,
+    resolved: Mapping[str, Optional[FieldDefinition]],
+) -> Tuple[str, ...]:
+    '''return required roles that the chosen target actually has
+
+    a profile never demands a column the production shapefile does not contain.
+    '''
+
+    return tuple(role for role in profile.required_roles if resolved.get(role))
 
 
 @dataclass(frozen=True)
-class ReleaseArtifactNames:
-    '''filenames created for one dated GIUM release'''
+class DatasetArtifactNames:
+    '''filenames created for one dataset in a dated GIUM release'''
 
-    line_shapefile: str
-    line_zip: str
-    point_shapefile: str
-    point_geojson: str
-    qa_csv: str
+    shapefile: str
+    zip: Optional[str] = None
+    geojson: Optional[str] = None
 
     def all(self) -> Tuple[str, ...]:
         '''return every filename in its normal release order'''
 
-        return (
-            self.line_shapefile,
-            self.line_zip,
-            self.point_shapefile,
-            self.point_geojson,
-            self.qa_csv,
+        return tuple(
+            name for name in (self.shapefile, self.zip, self.geojson) if name
         )
 
 
@@ -129,7 +329,7 @@ def field_definition(field: object) -> FieldDefinition:
 
 def resolve_role_fields(
     fields: Iterable[object],
-    profile: RoleProfile,
+    profile: LayerProfile,
     require_profile_roles: bool = True,
 ) -> Dict[str, Optional[FieldDefinition]]:
     '''match each GIUM role to one field without depending on capitalization
@@ -155,7 +355,7 @@ def resolve_role_fields(
             if require_profile_roles and role in profile.required_roles:
                 aliases_text = ', '.join(aliases)
                 raise ValueError(
-                    f'{profile.name.capitalize()} is missing the required {role} '
+                    f'{profile.name} is missing the required {role} '
                     f'field (accepted names: {aliases_text})'
                 )
             resolved[role] = None
@@ -208,16 +408,21 @@ def validate_required_values(
 
 
 def validate_role_field(role: str, field: object) -> FieldDefinition:
-    '''make sure a target field has the right type for its GIUM role'''
+    '''make sure a target field has the right type for its GIUM role
+
+    only roles the form can fill are constrained. a role such as source or
+    migrate_id is carried across from the new data untouched, so production is
+    free to store it in whichever type it already uses.
+    '''
 
     definition = field_definition(field)
-    if role == 'rotation':
+    if role in NUMERIC_ROLES:
         if definition.type not in NUMERIC_FIELD_TYPES:
             raise ValueError(
-                f'Rotation field {definition.name!r} must be numeric, not '
+                f'{role.capitalize()} field {definition.name!r} must be numeric, not '
                 f'{definition.type}'
             )
-    elif definition.type not in TEXT_FIELD_TYPES:
+    elif role in TEXT_ROLES and definition.type not in TEXT_FIELD_TYPES:
         raise ValueError(
             f'{role.capitalize()} field {definition.name!r} must be Text, not '
             f'{definition.type}'
@@ -342,33 +547,95 @@ def release_stamp(release_date: object) -> str:
     return f'{_MONTH_NAMES[date.month]}{date.day}_{date.year}'
 
 
-def release_artifact_names(release_date: object) -> ReleaseArtifactNames:
-    '''build the standard filenames for a GIUM release date'''
+_RELEASE_STAMP_PATTERN = re.compile(
+    r'_(?:' + '|'.join(_MONTH_NAMES[1:]) + r')\d{1,2}_\d{4}$',
+    re.IGNORECASE,
+)
 
-    stamp = release_stamp(release_date)
-    return ReleaseArtifactNames(
-        line_shapefile=f'SeasonalArrowsMerged_{stamp}.shp',
-        line_zip=f'SeasonalArrowsMerged_{stamp}.zip',
-        point_shapefile=f'GIUMPointLabelsMerged_{stamp}.shp',
-        point_geojson=f'GIUMPointLabelsMerged_{stamp}.geojson',
-        qa_csv=f'GIUMArrowIntegration_{stamp}_QA.csv',
+
+def strip_release_stamp(name: object) -> str:
+    '''drop a trailing MonthDay_Year stamp so a new one can be added
+
+    production targets are already dated, so naming a release after its target
+    would otherwise stack one stamp on top of another.
+    '''
+
+    base = os.path.basename(str(name or '').strip())
+    base = os.path.splitext(base)[0]
+    return _RELEASE_STAMP_PATTERN.sub('', base)
+
+
+def dataset_base_name(
+    profile: LayerProfile,
+    release_date: object,
+    target_name: object = None,
+) -> str:
+    '''build the dated output name for one dataset in a release'''
+
+    base = profile.output_base or strip_release_stamp(target_name)
+    if not base:
+        raise ValueError(
+            f'The {profile.name} layer type is named after its production target, '
+            'so a target shapefile name is required.'
+        )
+    return f'{base}_{release_stamp(release_date)}'
+
+
+def release_artifact_names(
+    profile: LayerProfile,
+    release_date: object,
+    package: object = None,
+    target_name: object = None,
+) -> DatasetArtifactNames:
+    '''build the filenames one dataset contributes to a GIUM release'''
+
+    base = dataset_base_name(profile, release_date, target_name)
+    formats = resolve_package_formats(package, profile)
+    return DatasetArtifactNames(
+        shapefile=f'{base}.shp',
+        zip=f'{base}.zip' if 'zip' in formats else None,
+        geojson=f'{base}.geojson' if 'geojson' in formats else None,
     )
 
 
-def release_artifact_paths(output_folder: object, release_date: object) -> Dict[str, str]:
-    '''join the release filenames to a folder without creating anything'''
+def release_artifact_paths(
+    output_folder: object,
+    profile: LayerProfile,
+    release_date: object,
+    package: object = None,
+    target_name: object = None,
+) -> Dict[str, str]:
+    '''join one dataset's release filenames to a folder without creating anything'''
+
+    folder = _required_folder(output_folder)
+    names = release_artifact_names(profile, release_date, package, target_name)
+    paths = {'shapefile': os.path.join(folder, names.shapefile)}
+    if names.zip:
+        paths['zip'] = os.path.join(folder, names.zip)
+    if names.geojson:
+        paths['geojson'] = os.path.join(folder, names.geojson)
+    return paths
+
+
+def qa_report_name(release_date: object) -> str:
+    '''name the single QA report that covers every dataset in a release'''
+
+    return f'GIUMIntegration_{release_stamp(release_date)}_QA.csv'
+
+
+def qa_report_path(output_folder: object, release_date: object) -> str:
+    '''join the QA report name to a folder without creating anything'''
+
+    return os.path.join(_required_folder(output_folder), qa_report_name(release_date))
+
+
+def _required_folder(output_folder: object) -> str:
+    '''reject a blank output folder before any path is built from it'''
 
     folder = str(output_folder or '').strip()
     if not folder:
         raise ValueError('Output folder is required')
-    names = release_artifact_names(release_date)
-    return {
-        'line_shapefile': os.path.join(folder, names.line_shapefile),
-        'line_zip': os.path.join(folder, names.line_zip),
-        'point_shapefile': os.path.join(folder, names.point_shapefile),
-        'point_geojson': os.path.join(folder, names.point_geojson),
-        'qa_csv': os.path.join(folder, names.qa_csv),
-    }
+    return folder
 
 
 def find_artifact_collisions(
@@ -412,7 +679,7 @@ def select_shapefile_zip_members(
     paths: Iterable[object],
     shapefile_name: object,
 ) -> Tuple[str, ...]:
-    '''choose the shapefile sidecars that belong in the line ZIP
+    '''choose the shapefile sidecars that belong in a release ZIP
 
     paths are returned in a consistent order and written at the root of the ZIP.
     '''

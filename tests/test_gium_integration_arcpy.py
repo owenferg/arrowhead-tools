@@ -43,8 +43,9 @@ class Field:
 
 
 class Geometry:
-    def __init__(self, empty=False):
+    def __init__(self, empty=False, part_count=1):
         self.isEmpty = empty
+        self.partCount = part_count
 
 
 class Dataset:
@@ -228,6 +229,8 @@ def production_fields(kind):
             Field('Shape', 'Geometry', required=True, editable=False)]
     if kind == 'Polyline':
         return base + [Field('HerdName'), Field('Country'), Field('Season'), Field('Class')]
+    if kind == 'Polygon':
+        return base + [Field('Type'), Field('Class'), Field('Herd_Name'), Field('Country')]
     return base + [Field('Herd_Name'), Field('Season'), Field('Type'), Field('Rotation', 'Double')]
 
 
@@ -286,28 +289,64 @@ class GiumIntegrationArcPyTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def run_tool(self, **changes):
+    def line_row(self, **changes):
+        row = [
+            'Seasonal arrows', self.line_target, self.line_layer,
+            'Migration', '', 'Spring migration', '', '',
+        ]
+        keys = (
+            'layer_type', 'target', 'new_data', 'class', 'type', 'season',
+            'package', 'transformation',
+        )
+        for key, value in changes.items():
+            row[keys.index(key)] = value
+        return row
+
+    def point_row(self, **changes):
+        row = [
+            'GIUM point labels', self.point_target, self.point_layer,
+            '', 'Arrowhead', 'Spring migration', '', '',
+        ]
+        keys = (
+            'layer_type', 'target', 'new_data', 'class', 'type', 'season',
+            'package', 'transformation',
+        )
+        for key, value in changes.items():
+            row[keys.index(key)] = value
+        return row
+
+    def run_tool(self, datasets=None, **changes):
         values = dict(
-            process_lines=True, line_target=self.line_target, new_lines=self.line_layer,
-            line_transformation='', process_points=True, point_target=self.point_target,
-            new_points=self.point_layer, point_transformation='', herd_name='Test Herd',
-            country='Kazakhstan', season='Spring migration', line_class='Migration',
-            point_type='Arrowhead', release_date='2026-08-04',
+            datasets=datasets if datasets is not None else [
+                self.line_row(), self.point_row(),
+            ],
+            herd_name='Test Herd',
+            country='Kazakhstan',
+            release_date='2026-08-04',
             output_folder=str(self.release),
         )
         values.update(changes)
         return self.tool.execute(**values)
+
+    def created_named(self, result, filename):
+        for path in result.created:
+            if os.path.basename(path) == filename:
+                return path
+        self.fail('%s not in %s' % (filename, result.created))
 
     def test_complete_release_is_packaged_without_changing_targets(self):
         result = self.run_tool()
 
         self.assertEqual(len(self.arcpy.datasets[self.line_target].rows), 1)
         self.assertEqual(len(self.arcpy.datasets[self.point_target].rows), 1)
-        for path in (result.line_output, result.line_zip, result.point_output,
-                     result.point_geojson, result.qa_csv):
+        line_zip = self.created_named(result, 'SeasonalArrowsMerged_August4_2026.zip')
+        point_geojson = self.created_named(
+            result, 'GIUMPointLabelsMerged_August4_2026.geojson'
+        )
+        for path in (line_zip, point_geojson, result.qa_csv):
             self.assertTrue(os.path.isfile(path), path)
         self.assertFalse(list(self.release.glob('*.lock')))
-        with zipfile.ZipFile(result.line_zip) as archive:
+        with zipfile.ZipFile(line_zip) as archive:
             self.assertTrue(
                 {
                     'SeasonalArrowsMerged_August4_2026.shp',
@@ -330,10 +369,12 @@ class GiumIntegrationArcPyTests(unittest.TestCase):
         ))
         self.assertTrue(any('visual review' in message for message in self.arcpy.messages))
 
-    def test_text_false_disables_branch(self):
-        result = self.run_tool(process_lines='false', line_target=None, new_lines=None)
-        self.assertIsNone(result.line_output)
-        self.assertTrue(os.path.isfile(result.point_output))
+    def test_points_only_release_skips_line_outputs(self):
+        result = self.run_tool(datasets=[self.point_row()])
+        self.assertFalse(any(path.endswith('.zip') for path in result.created))
+        self.assertTrue(os.path.isfile(
+            self.created_named(result, 'GIUMPointLabelsMerged_August4_2026.geojson')
+        ))
 
     def test_target_layer_selection_is_ignored_but_new_selection_is_honored(self):
         target_layer = 'selected_historical_line_layer'
@@ -343,8 +384,7 @@ class GiumIntegrationArcPyTests(unittest.TestCase):
             target_layer, 'Polyline', self.sr, target.fields,
             [target.rows[0]], self.line_target,
         )
-        result = self.run_tool(line_target=target_layer, process_points=False,
-                               point_target=None, new_points=None)
+        result = self.run_tool(datasets=[self.line_row(target=target_layer)])
         with open(result.qa_csv, encoding='utf-8-sig') as stream:
             qa = {row['check']: row['value'] for row in csv.DictReader(stream)}
         self.assertEqual(qa['historical_count'], '2')
@@ -353,7 +393,7 @@ class GiumIntegrationArcPyTests(unittest.TestCase):
 
     def test_unavailable_requested_transformation_fails_in_preflight(self):
         with self.assertRaisesRegex(ValueError, 'not valid'):
-            self.run_tool(line_transformation='NOT_A_REAL_TRANSFORM')
+            self.run_tool(datasets=[self.line_row(transformation='NOT_A_REAL_TRANSFORM')])
         self.assertFalse(self.release.exists() and any(self.release.iterdir()))
 
     def test_target_must_be_production_shapefile(self):
@@ -362,7 +402,7 @@ class GiumIntegrationArcPyTests(unittest.TestCase):
         )
         self.arcpy.datasets['target_in_gdb'].catalog_path = '/test.gdb/seasonal_target'
         with self.assertRaisesRegex(ValueError, 'production shapefile'):
-            self.run_tool(line_target='target_in_gdb')
+            self.run_tool(datasets=[self.line_row(target='target_in_gdb')])
 
     def test_joined_new_layer_is_rejected_with_clear_instruction(self):
         self.arcpy.datasets[self.line_layer].fields.append(Field('lookup.value'))
@@ -441,6 +481,66 @@ class GiumIntegrationArcPyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'already exists'):
             self.run_tool()
         self.assertEqual(orphan.read_text(), 'old')
+
+    def test_multipart_new_data_fails_in_preflight(self):
+        self.arcpy.datasets[self.line_layer].rows[0]['geometry'] = Geometry(part_count=2)
+        with self.assertRaisesRegex(ValueError, 'multipart'):
+            self.run_tool()
+        self.assertFalse(self.release.exists() and any(self.release.iterdir()))
+
+    def test_polygon_row_is_packaged_as_a_zip(self):
+        root = pathlib.Path(self.temp.name)
+        poly_target = str(root / 'poly_features_old.shp')
+        poly_source = str(root / 'source_polys')
+        historical = {
+            'oid': 1, 'geometry': Geometry(), 'Type': 'Range', 'Class': 'Range',
+            'Herd_Name': 'Old', 'Country': 'Canada',
+        }
+        selected = {
+            'oid': 2, 'geometry': Geometry(), 'Type': '', 'Class': '',
+            'Herd_Name': '', 'Country': '',
+        }
+        self.arcpy.datasets[poly_target] = Dataset(
+            poly_target, 'Polygon', self.sr, production_fields('Polygon'), [historical]
+        )
+        self.arcpy.datasets[poly_source] = Dataset(
+            poly_source, 'Polygon', self.source_sr, production_fields('Polygon'), [selected]
+        )
+        result = self.run_tool(datasets=[[
+            'Polygon features', poly_target, poly_source,
+            'Range', 'Migration land', '', '', '',
+        ]])
+        zip_path = self.created_named(result, 'poly_features_August4_2026.zip')
+        self.assertTrue(os.path.isfile(zip_path))
+        self.assertFalse(any(path.endswith('.geojson') for path in result.created))
+
+    def test_three_row_release_packages_each_dataset(self):
+        root = pathlib.Path(self.temp.name)
+        poly_target = str(root / 'ProtectedAreas_old.shp')
+        poly_source = str(root / 'source_pa')
+        historical = {
+            'oid': 1, 'geometry': Geometry(), 'Type': 'Protected Area',
+            'Class': '', 'Herd_Name': 'Old', 'Country': 'Canada',
+        }
+        selected = {
+            'oid': 2, 'geometry': Geometry(), 'Type': '',
+            'Class': '', 'Herd_Name': '', 'Country': '',
+        }
+        self.arcpy.datasets[poly_target] = Dataset(
+            poly_target, 'Polygon', self.sr, production_fields('Polygon'), [historical]
+        )
+        self.arcpy.datasets[poly_source] = Dataset(
+            poly_source, 'Polygon', self.source_sr, production_fields('Polygon'), [selected]
+        )
+        result = self.run_tool(datasets=[
+            self.line_row(),
+            self.point_row(),
+            ['Protected areas', poly_target, poly_source, '', 'Protected Area', '', '', ''],
+        ])
+        self.created_named(result, 'SeasonalArrowsMerged_August4_2026.zip')
+        self.created_named(result, 'GIUMPointLabelsMerged_August4_2026.geojson')
+        self.created_named(result, 'ProtectedAreas_August4_2026.zip')
+        self.assertEqual(os.path.basename(result.qa_csv), 'GIUMIntegration_August4_2026_QA.csv')
 
 
 if __name__ == '__main__':

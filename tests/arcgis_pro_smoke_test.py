@@ -45,14 +45,14 @@ def _field_names(dataset: str) -> set[str]:
     }
 
 
-def _result_path(result, name: str) -> pathlib.Path:
-    '''read an integration output from either result format'''
+def _created_file(result, filename: str) -> pathlib.Path:
+    '''find one dated release file in the created list'''
 
-    if isinstance(result, dict):
-        value = result[name]
-    else:
-        value = getattr(result, name)
-    return pathlib.Path(value)
+    created = result["created"] if isinstance(result, dict) else result.created
+    for path in created:
+        if pathlib.Path(path).name == filename:
+            return pathlib.Path(path)
+    raise AssertionError(f"{filename} not in {created}")
 
 
 def _add_text_fields(dataset: str, fields: list[tuple[str, int]]) -> None:
@@ -222,34 +222,47 @@ def _run_gium_integration_smoke(folder: str, geodatabase: str) -> None:
     pathlib.Path(release_folder).mkdir()
 
     result = gium_integration_arcpy.execute(
-        True,
-        line_target_layer,
-        line_layer,
-        "",
-        True,
-        point_target_layer,
-        point_layer,
-        "",
+        [
+            [
+                "Seasonal arrows",
+                line_target_layer,
+                line_layer,
+                "Migration",
+                "",
+                "Deliberately different fallback season",
+                "",
+                "",
+            ],
+            [
+                "GIUM point labels",
+                point_target_layer,
+                point_layer,
+                "",
+                "Arrowhead",
+                "Deliberately different fallback season",
+                "",
+                "",
+            ],
+        ],
         "Smoke Test Herd",
         "Kazakhstan",
-        "Deliberately different fallback season",
-        "Migration",
-        "Arrowhead",
         release_date,
         release_folder,
     )
 
-    line_output = _result_path(result, "line_output")
-    line_zip = _result_path(result, "line_zip")
-    point_output = _result_path(result, "point_output")
-    point_geojson = _result_path(result, "point_geojson")
-    qa_csv = _result_path(result, "qa_csv")
+    line_output = _created_file(result, "SeasonalArrowsMerged_January2_2026.shp")
+    line_zip = _created_file(result, "SeasonalArrowsMerged_January2_2026.zip")
+    point_output = _created_file(result, "GIUMPointLabelsMerged_January2_2026.shp")
+    point_geojson = _created_file(result, "GIUMPointLabelsMerged_January2_2026.geojson")
+    qa_csv = pathlib.Path(
+        result["qa_csv"] if isinstance(result, dict) else result.qa_csv
+    )
 
     assert line_output.name == "SeasonalArrowsMerged_January2_2026.shp", line_output
     assert point_output.name == "GIUMPointLabelsMerged_January2_2026.shp", point_output
     assert line_zip.name == "SeasonalArrowsMerged_January2_2026.zip", line_zip
     assert point_geojson.name == "GIUMPointLabelsMerged_January2_2026.geojson", point_geojson
-    assert qa_csv.name == "GIUMArrowIntegration_January2_2026_QA.csv", qa_csv
+    assert qa_csv.name == "GIUMIntegration_January2_2026_QA.csv", qa_csv
     for artifact in (line_output, line_zip, point_output, point_geojson, qa_csv):
         assert artifact.exists(), artifact
 
@@ -347,19 +360,30 @@ def _run_gium_integration_smoke(folder: str, geodatabase: str) -> None:
     failed_release_folder.mkdir()
     try:
         gium_integration_arcpy.execute(
-            True,
-            line_target,
-            line_layer,
-            "",
-            True,
-            point_target,
-            failed_point_layer,
-            "",
+            [
+                [
+                    "Seasonal arrows",
+                    line_target,
+                    line_layer,
+                    "Migration",
+                    "",
+                    "Spring migration",
+                    "",
+                    "",
+                ],
+                [
+                    "GIUM point labels",
+                    point_target,
+                    failed_point_layer,
+                    "",
+                    "Arrowhead",
+                    "Spring migration",
+                    "",
+                    "",
+                ],
+            ],
             "Smoke Test Herd",
             "Kazakhstan",
-            "Spring migration",
-            "Migration",
-            "Arrowhead",
             datetime.datetime(2026, 1, 3),
             str(failed_release_folder),
         )
@@ -370,7 +394,7 @@ def _run_gium_integration_smoke(folder: str, geodatabase: str) -> None:
     assert not list(failed_release_folder.glob("SeasonalArrowsMerged_January3_2026.*"))
     assert not list(failed_release_folder.glob("GIUMPointLabelsMerged_January3_2026.*"))
     assert not list(
-        failed_release_folder.glob("GIUMArrowIntegration_January3_2026_QA.csv")
+        failed_release_folder.glob("GIUMIntegration_January3_2026_QA.csv")
     )
     assert _count(line_target) == before_line_count
     assert _count(point_target) == before_point_count
