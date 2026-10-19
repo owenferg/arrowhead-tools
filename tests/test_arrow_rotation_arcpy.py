@@ -85,13 +85,38 @@ class CursorBase:
 
 
 class SearchCursor(CursorBase):
-    def __init__(self, arcpy, layer, fields):
+    def __init__(self, arcpy, layer, fields, spatial_reference=None):
         self.dataset = arcpy.datasets[layer]
         self.fields = fields
+        self.spatial_reference = spatial_reference
+        # remember how each cursor was opened so tests can check the projection setup
+        arcpy.cursors.append((
+            layer, spatial_reference,
+            getattr(arcpy.env, "geographicTransformations", None),
+        ))
 
     def __iter__(self):
         for row in self.dataset.rows:
-            yield tuple(_field_value(row, field) for field in self.fields)
+            yield tuple(
+                _field_value(row, field, self.spatial_reference) for field in self.fields
+            )
+
+
+class EnvManager:
+    def __init__(self, arcpy, **settings):
+        self.arcpy = arcpy
+        self.settings = settings
+
+    def __enter__(self):
+        self.previous = {name: getattr(self.arcpy.env, name, None) for name in self.settings}
+        for name, value in self.settings.items():
+            setattr(self.arcpy.env, name, value)
+        return self
+
+    def __exit__(self, *args):
+        for name, value in self.previous.items():
+            setattr(self.arcpy.env, name, value)
+        return False
 
 
 class UpdateCursor(SearchCursor):
@@ -115,11 +140,20 @@ class InsertCursor(CursorBase):
         self.dataset.rows.append(dict(zip(self.fields, values)))
 
 
-def _field_value(row, field):
+def _field_value(row, field, spatial_reference=None):
     if field == "OID@":
         return row["oid"]
     if field == "SHAPE@":
-        return row["geometry"]
+        geometry = row["geometry"]
+        if geometry is None or spatial_reference is None:
+            return geometry
+        # the cursor projects for us, coordinates stay the same in the fake
+        projected = Geometry(spatial_reference)
+        projected._parts = geometry._parts
+        projected.firstPoint = geometry.firstPoint
+        projected.pointCount = geometry.pointCount
+        projected.hasCurves = geometry.hasCurves
+        return projected
     return row.get(field)
 
 
@@ -128,7 +162,9 @@ def build_fake_arcpy():
     module.datasets = {}
     module.messages = []
     module.warnings = []
-    module.env = types.SimpleNamespace(overwriteOutput=True)
+    module.cursors = []
+    module.env = types.SimpleNamespace(overwriteOutput=True, geographicTransformations=None)
+    module.EnvManager = lambda **settings: EnvManager(module, **settings)
     module.SpatialReference = lambda code: SpatialReference(code)
     module.AddMessage = module.messages.append
     module.AddWarning = module.warnings.append
@@ -152,7 +188,9 @@ def build_fake_arcpy():
 
     module.Describe = describe
     module.da = types.SimpleNamespace(
-        SearchCursor=lambda layer, fields: SearchCursor(module, layer, fields),
+        SearchCursor=lambda layer, fields, spatial_reference=None: SearchCursor(
+            module, layer, fields, spatial_reference
+        ),
         UpdateCursor=lambda layer, fields: UpdateCursor(module, layer, fields),
         InsertCursor=lambda layer, fields: InsertCursor(module, layer, fields),
     )
@@ -259,6 +297,65 @@ class ArrowToolTests(unittest.TestCase):
     def test_non_numeric_rotation_field_is_rejected_before_update(self):
         self.arcpy.datasets["points"].fields[-1].type = "String"
         with self.assertRaisesRegex(ValueError, "must be numeric"):
+            self.tool.execute("points", "lines", "2 Meters", "rotation_deg", None)
+        self.assertEqual(self.point_rows[0]["rotation_deg"], 33)
+
+    def test_big_integer_rotation_field_is_accepted(self):
+        self.arcpy.datasets["points"].fields[-1].type = "BigInteger"
+        self.tool.execute("points", "lines", "2 Meters", "rotation_deg", None)
+        self.assertEqual(self.point_rows[0]["rotation_deg"], 0)
+        self.assertEqual(self.point_rows[1]["rotation_deg"], 180)
+
+    def test_cursors_project_in_the_same_spatial_reference_without_a_transformation(self):
+        self.tool.execute("points", "lines", "2 Meters", "rotation_deg", None)
+
+        sr = self.arcpy.datasets["points"].spatial_reference
+        # the line and point reads come first, the update cursor has no projection
+        self.assertEqual(
+            self.arcpy.cursors[:2],
+            [("lines", sr, None), ("points", sr, None)],
+        )
+
+    def test_geographic_layers_are_projected_by_the_cursor_with_a_transformation(self):
+        geographic = SpatialReference(4326, "WGS 84", "Geographic")
+        for dataset in (self.arcpy.datasets["points"], self.arcpy.datasets["lines"]):
+            dataset.spatial_reference = geographic
+            for row in dataset.rows:
+                row["geometry"].spatialReference = geographic
+
+        def fail_project(*args, **kwargs):
+            raise AssertionError("geometries should be projected by the cursor")
+
+        original = Geometry.projectAs
+        Geometry.projectAs = fail_project
+        try:
+            self.tool.execute("points", "lines", "2 Meters", "rotation_deg", None)
+        finally:
+            Geometry.projectAs = original
+
+        self.assertEqual(self.point_rows[0]["rotation_deg"], 0)
+        self.assertEqual(self.point_rows[1]["rotation_deg"], 180)
+        reads = self.arcpy.cursors[:2]
+        self.assertEqual([layer for layer, unused, unused2 in reads], ["lines", "points"])
+        for unused, spatial_reference, transformation in reads:
+            self.assertEqual(spatial_reference.factoryCode, 3857)
+            self.assertEqual(transformation, "TEST_TRANSFORM")
+        # the transformation environment is restored after the cursors close
+        self.assertIsNone(self.arcpy.env.geographicTransformations)
+
+    def test_missing_transformation_does_not_set_the_environment(self):
+        geographic = SpatialReference(4326, "WGS 84", "Geographic")
+        self.arcpy.datasets["lines"].spatial_reference = geographic
+        self.arcpy.ListTransformations = lambda source, target, extent: []
+
+        self.tool.execute("points", "lines", "2 Meters", "rotation_deg", None)
+
+        self.assertEqual(self.arcpy.cursors[0][0], "lines")
+        self.assertIsNone(self.arcpy.cursors[0][2])
+
+    def test_unknown_line_spatial_reference_is_rejected(self):
+        self.arcpy.datasets["lines"].spatial_reference = SpatialReference(0, "Unknown")
+        with self.assertRaisesRegex(ValueError, "defined spatial reference"):
             self.tool.execute("points", "lines", "2 Meters", "rotation_deg", None)
         self.assertEqual(self.point_rows[0]["rotation_deg"], 33)
 

@@ -7,6 +7,7 @@ import importlib
 import datetime
 import os
 import arcpy  # pyright: ignore[reportMissingImports]
+import arcpy_common
 import arrow_rotation_core
 import arrow_creation_arcpy
 import arrow_rotation_arcpy
@@ -14,6 +15,7 @@ import gium_integration_core
 import gium_integration_arcpy
 
 # reload the scripts when the toolbox is refreshed so ArcGIS does not use older cached versions
+arcpy_common = importlib.reload(arcpy_common)
 arrow_rotation_core = importlib.reload(arrow_rotation_core)
 arrow_creation_arcpy = importlib.reload(arrow_creation_arcpy)
 arrow_rotation_arcpy = importlib.reload(arrow_rotation_arcpy)
@@ -85,6 +87,10 @@ def _default_output_path(lines):
     return os.path.join(workspace, output_name)
 
 
+# arrowhead symbol whose rotation reads $feature.Rotation, replace it to use a different arrow
+_ARROWHEAD_SYMBOLOGY = os.path.join(os.path.dirname(__file__), "arrowhead_symbology.lyrx")
+
+
 def _default_release_folder(*datasets):
     '''suggest a normal folder beside the first selected production dataset'''
 
@@ -127,6 +133,31 @@ def _available_transformations(source_layer, target_layer):
         ) or [])
     except Exception:
         return []
+
+
+def _add_release_layers_to_map(paths):
+    '''add the released shapefiles to the open map so they can be reviewed right away'''
+
+    shapefiles = [path for path in paths or [] if str(path).lower().endswith(".shp")]
+    if not shapefiles:
+        return
+    try:
+        active_map = getattr(arcpy.mp.ArcGISProject("CURRENT"), "activeMap", None)
+    except Exception:
+        active_map = None
+    if active_map is None:
+        arcpy.AddMessage(
+            "No map is open, so the release layers were not added to a map. "
+            "They are saved in the release output folder."
+        )
+        return
+    for path in shapefiles:
+        try:
+            active_map.addDataFromPath(path)
+            arcpy.AddMessage(f"Added {os.path.basename(path)} to the {active_map.name} map.")
+        except Exception as error:
+            # the release is already published, so a map problem should never fail the tool
+            arcpy.AddWarning(f"Could not add {path} to the map: {error}")
 
 
 def _is_shapefile_layer(layer):
@@ -222,6 +253,8 @@ class CreateArrowheadsFromLineEndpoints:
             direction="Output",
         )
         output.schema.geometryType = "Point"
+        # draw the new points as rotated arrowheads, execute retargets this to the real field
+        output.symbology = _ARROWHEAD_SYMBOLOGY
 
         return [
             lines, placement, custom_placement_field, field_name, rotation_buffer, output,
@@ -268,7 +301,7 @@ class CreateArrowheadsFromLineEndpoints:
 
     def execute(self, parameters, messages):
         try:
-            arrow_creation_arcpy.execute(
+            rotation_field = arrow_creation_arcpy.execute(
                 parameters[0].valueAsText, # lines
                 parameters[1].valueAsText, # arrowhead placement
                 parameters[3].valueAsText, # rotation field name
@@ -279,6 +312,19 @@ class CreateArrowheadsFromLineEndpoints:
         except Exception as exc:
             arcpy.AddError(str(exc))
             raise
+
+        if rotation_field:
+            # symbology is only a convenience, so it never fails a finished run
+            try:
+                parameters[5].symbology = arrow_creation_arcpy.arrowhead_symbology(
+                    rotation_field, _ARROWHEAD_SYMBOLOGY
+                )
+            except Exception as exc:
+                arcpy.AddWarning(
+                    f"Could not apply arrowhead symbology ({exc}). Set it manually with "
+                    "Symbology > Vary symbology by attribute > Rotation, using the "
+                    f"{rotation_field} field and the Geographic rotation type."
+                )
 
 class RotateArrowheads:
     def __init__(self):
@@ -385,8 +431,8 @@ class RotateArrowheads:
 class IntegrateGIUMData:
     '''GIUM release workflow for any number of existing production layers'''
 
-    _SPELLCHECK_ROLES = ('class', 'type')
-    _VALUE_LIST_LIMIT = 12
+    _SPELLCHECK_ROLES = gium_integration_core.SPELLCHECK_ROLES
+    _VALUE_LIST_LIMIT = gium_integration_core.SPELLCHECK_LIST_LIMIT
 
     def __init__(self):
         self.label = "Integrate Data into Existing GIUM Layers"
@@ -399,6 +445,8 @@ class IntegrateGIUMData:
         self.canRunInBackground = False
         self._generated_output_folder = None
         self._value_cache = {}
+        # arcpy lookups per layer, so editing one cell does not describe every row again
+        self._layer_cache = {}
 
     @staticmethod
     def _parameter(
@@ -472,13 +520,32 @@ class IntegrateGIUMData:
             "2. Shared metadata",
         )
 
+        split_multipart = self._parameter(
+            "Split multipart features into single parts",
+            "split_multipart",
+            "GPBoolean",
+            "Optional",
+            "Input",
+            "3. Options",
+        )
+        split_multipart.value = False
+        project_without_transformation = self._parameter(
+            "Project without a datum transformation when ArcGIS has none",
+            "project_without_transformation",
+            "GPBoolean",
+            "Optional",
+            "Input",
+            "3. Options",
+        )
+        project_without_transformation.value = False
+
         created = self._parameter(
             "Created release files",
             "created_files",
             "DEFile",
             "Derived",
             "Output",
-            "3. Created release",
+            "4. Created release",
         )
         created.multiValue = True
         qa_csv = self._parameter(
@@ -487,7 +554,7 @@ class IntegrateGIUMData:
             "DEFile",
             "Derived",
             "Output",
-            "3. Created release",
+            "4. Created release",
         )
 
         return [
@@ -496,6 +563,8 @@ class IntegrateGIUMData:
             country,
             release_date,
             output_folder,
+            split_multipart,
+            project_without_transformation,
             created,
             qa_csv,
         ]
@@ -516,61 +585,138 @@ class IntegrateGIUMData:
             return ""
         return str(value).strip()
 
+    def _cached(self, kind, key, lookup, remember_empty=True):
+        '''run an arcpy lookup once per layer text so unchanged rows skip arcpy
+
+        remember_empty=False retries a failed or empty lookup on the next edit,
+        so a layer that was broken when first checked is not stuck as an error.
+        '''
+
+        cache_key = (kind, key)
+        if cache_key in self._layer_cache:
+            return self._layer_cache[cache_key]
+        value = lookup()
+        if value or remember_empty:
+            self._layer_cache[cache_key] = value
+        return value
+
+    @staticmethod
+    def _layer_key(layer):
+        return str(layer)
+
+    def _shape_type(self, layer):
+        def lookup():
+            try:
+                return getattr(arcpy.Describe(layer), "shapeType", None)
+            except Exception:
+                return None
+
+        return self._cached("shape", self._layer_key(layer), lookup, remember_empty=False)
+
+    def _catalog_path(self, layer):
+        def lookup():
+            try:
+                return str(getattr(arcpy.Describe(layer), "catalogPath", None) or layer)
+            except Exception:
+                return None
+
+        return self._cached("catalog", self._layer_key(layer), lookup, remember_empty=False)
+
+    def _is_shapefile(self, layer):
+        return self._cached(
+            "shapefile", self._layer_key(layer),
+            lambda: _is_shapefile_layer(layer), remember_empty=False,
+        )
+
+    def _transformations(self, new_data, target):
+        return self._cached(
+            "transformations", (self._layer_key(new_data), self._layer_key(target)),
+            lambda: _available_transformations(new_data, target),
+        )
+
     def _role_field_name(self, dataset, profile, role):
         aliases = {alias.casefold() for alias in profile.aliases.get(role, ())}
         if not aliases:
             return None
         try:
-            matches = [
-                field.name
-                for field in arcpy.ListFields(dataset)
-                if field.name.casefold() in aliases
-            ]
+            names = self._cached(
+                "fields", self._layer_key(dataset),
+                lambda: [field.name for field in arcpy.ListFields(dataset)],
+                remember_empty=False,
+            )
         except Exception:
             return None
+        matches = [name for name in names if name.casefold() in aliases]
         return matches[0] if len(matches) == 1 else None
 
     def _distinct_field_values(self, dataset, field_name):
+        path = self._catalog_path(dataset) or str(dataset)
         try:
-            catalog = getattr(arcpy.Describe(dataset), "catalogPath", dataset)
-            path = str(catalog)
             mtime = os.path.getmtime(path) if os.path.exists(path) else None
             size = os.path.getsize(path) if os.path.exists(path) else None
-        except Exception:
-            path, mtime, size = str(dataset), None, None
+        except OSError:
+            mtime, size = None, None
         cache_key = (path, field_name.casefold())
         cached = self._value_cache.get(cache_key)
         if cached and cached[0] == mtime and cached[1] == size:
             return cached[2]
-        values = []
-        seen = set()
         try:
             with arcpy.da.SearchCursor(dataset, [field_name]) as rows:
-                for (value,) in rows:
-                    text = "" if value is None else str(value).strip()
-                    if text and text not in seen:
-                        seen.add(text)
-                        values.append(text)
+                values = gium_integration_core.distinct_text_values(
+                    value for (value,) in rows
+                )
         except Exception:
             values = []
         self._value_cache[cache_key] = (mtime, size, values)
         return values
 
     def _spellcheck_warning(self, row_number, role, typed, existing):
-        if typed in existing:
-            return None
-        listed = existing[: self._VALUE_LIST_LIMIT]
-        extra = len(existing) - len(listed)
-        choices = ", ".join(listed)
-        if extra > 0:
-            choices = f"{choices}, and {extra} more"
-        return (
-            f"Row {row_number} {role} {typed!r} is not an existing value. "
-            f"Existing values are: {choices}. If this is a genuinely new {role}, "
-            "you can ignore this."
+        return gium_integration_core.spellcheck_warning(
+            f"Row {row_number}", role, typed, existing, self._VALUE_LIST_LIMIT
         )
 
+    def _fill_shared_values(self, parameter):
+        '''fill a blank class or type cell when every production feature shares one value'''
+
+        rows = self._table_rows(parameter)
+        fills = []
+        for row_index, row in enumerate(rows):
+            if not row or len(row) <= 4 or not row[1]:
+                continue
+            try:
+                profile = gium_integration_core.layer_profile(self._cell_text(row[0]))
+            except ValueError:
+                continue
+            for role in self._SPELLCHECK_ROLES:
+                column = gium_integration_core.DATASET_COLUMNS.index(role)
+                if self._cell_text(row[column]):
+                    continue
+                field_name = self._role_field_name(row[1], profile, role)
+                if not field_name:
+                    continue
+                shared = gium_integration_core.shared_value(
+                    self._distinct_field_values(row[1], field_name)
+                )
+                if shared:
+                    fills.append((row_index, column, shared))
+        if not fills:
+            return
+
+        # edit only the filled cells. writing the whole table back through
+        # .values drops the layer cells, which cleared the production shapefile
+        table = parameter.value
+        if hasattr(table, "setValue"):
+            for row_index, column, shared in fills:
+                table.setValue(row_index, column, shared)
+            parameter.value = table
+        else:
+            for row_index, column, shared in fills:
+                rows[row_index][column] = shared
+            parameter.values = rows
+
     def updateParameters(self, parameters):
+        self._fill_shared_values(parameters[0])
+
         output = parameters[4]
         if not output.altered or output.valueAsText == self._generated_output_folder:
             targets = []
@@ -605,7 +751,7 @@ class IntegrateGIUMData:
                 continue
             if not target:
                 errors.append(f"Row {index} needs an existing production shapefile.")
-            elif not _is_shapefile_layer(target):
+            elif not self._is_shapefile(target):
                 errors.append(
                     f"Row {index}: the target must be the complete production .shp file, "
                     "not a geodatabase feature class."
@@ -619,11 +765,8 @@ class IntegrateGIUMData:
                     errors.append(f"Row {index}: {error}")
             if target and new_data:
                 expected = profile.shape_type
-                try:
-                    target_shape = getattr(arcpy.Describe(target), "shapeType", None)
-                    source_shape = getattr(arcpy.Describe(new_data), "shapeType", None)
-                except Exception:
-                    target_shape = source_shape = None
+                target_shape = self._shape_type(target)
+                source_shape = self._shape_type(new_data)
                 if expected and target_shape and target_shape != expected:
                     errors.append(
                         f"Row {index}: {profile.name} needs {expected.lower()} features."
@@ -632,7 +775,7 @@ class IntegrateGIUMData:
                     errors.append(
                         f"Row {index}: the new data must contain {expected.lower()} features."
                     )
-                available = _available_transformations(new_data, target)
+                available = self._transformations(new_data, target)
                 if transformation and available and transformation not in available:
                     warnings.append(
                         f"Row {index}: geographic transformation {transformation!r} is "
@@ -642,8 +785,9 @@ class IntegrateGIUMData:
                 elif transformation and not available:
                     warnings.append(
                         f"Row {index}: ArcGIS Pro did not find a geographic transformation "
-                        "for these layers. Leave this cell blank, or run the Project tool "
-                        "first if the datums differ."
+                        "for these layers. Leave this cell blank. If the datums differ, run "
+                        "the Project tool first, or check \"Project without a datum "
+                        "transformation when ArcGIS has none\" under Options."
                     )
             if target:
                 typed = {
@@ -683,17 +827,20 @@ class IntegrateGIUMData:
             rows = self._table_rows(parameters[0])
             result = gium_integration_arcpy.execute(
                 rows,
-                parameters[1].valueAsText,
-                parameters[2].valueAsText,
-                parameters[3].value,
-                parameters[4].valueAsText,
+                parameters[1].valueAsText, # herd name
+                parameters[2].valueAsText, # country
+                parameters[3].value, # release date
+                parameters[4].valueAsText, # output folder
+                split_multipart=bool(parameters[5].value),
+                project_without_transformation=bool(parameters[6].value),
             )
             created = self._result_value(result, "created")
             if created:
-                parameters[5].value = created
+                parameters[7].value = created
             qa_csv = self._result_value(result, "qa_csv")
             if qa_csv:
-                parameters[6].value = qa_csv
+                parameters[8].value = qa_csv
+            _add_release_layers_to_map(created)
         except Exception as exc:
             arcpy.AddError(str(exc))
             raise

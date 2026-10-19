@@ -15,20 +15,11 @@ import shutil
 import tempfile
 import time
 import zipfile
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import arcpy  # pyright: ignore[reportMissingImports]
+import arcpy_common as common
 import gium_integration_core as core
-
-
-_SYSTEM_FIELD_TYPES = {'OID', 'Geometry', 'Blob', 'Raster', 'GlobalID'}
-_NUMERIC_FIELD_TYPES = {'SmallInteger', 'Integer', 'BigInteger', 'Single', 'Double'}
-_ADD_FIELD_TYPES = {
-    'SmallInteger': 'SHORT', 'Integer': 'LONG', 'BigInteger': 'BIGINTEGER',
-    'Single': 'FLOAT', 'Double': 'DOUBLE', 'String': 'TEXT', 'Date': 'DATE',
-    'DateOnly': 'DATEONLY', 'TimeOnly': 'TIMEONLY',
-    'TimestampOffset': 'TIMESTAMPOFFSET', 'Guid': 'GUID', 'GUID': 'GUID',
-}
 
 
 @dataclass
@@ -60,44 +51,56 @@ class _Dataset:
     zip_path: Optional[str] = None
     geojson_path: Optional[str] = None
     target_path: str = ''
+    new_catalog_path: str = ''
     target_sr: object = None
     source_sr: object = None
     transformation: str = ''
     historical_count: int = 0
     new_count: int = 0
+    original_new_count: int = 0
+    multipart_count: int = 0
+    missing_values: List[str] = field(default_factory=list)
+    source_field_names: Tuple[str, ...] = ()
+    source_stand_ins: Dict[str, str] = field(default_factory=dict)
+    tool_fields: Set[str] = field(default_factory=set)
     target_fields: Dict[str, object] = field(default_factory=dict)
     source_role_fields: Dict[str, str] = field(default_factory=dict)
     target_role_fields: Dict[str, str] = field(default_factory=dict)
     filled_counts: Dict[str, int] = field(default_factory=dict)
-    staged_target: str = ''
+    rotation_range: Optional[Tuple[float, float]] = None
     staged_new: str = ''
-    staged_output: str = ''
     staged_release: str = ''
 
 
-def _normalized_path(value) -> str:
-    '''normalize a path before comparing inputs and outputs'''
+@dataclass
+class _FieldPlan:
+    '''how the staged new fields map onto one production target'''
 
-    return os.path.normcase(os.path.abspath(str(value))).replace('\\', '/').lower()
+    mappings: object
+    mapped: List[str]
+    extra_text: List[Tuple[str, object]]
+    unmapped_new: List[str]
+    unfilled_target: List[str]
 
 
-def _same_spatial_reference(first, second) -> bool:
-    '''check whether two ArcGIS spatial references are the same'''
+def _qa(section, check, status, value, details):
+    '''make one row for the release QA report'''
 
-    if not first or not second:
-        return False
-    first_code = getattr(first, 'factoryCode', 0)
-    second_code = getattr(second, 'factoryCode', 0)
-    if first_code and second_code:
-        return first_code == second_code
-    return first.exportToString() == second.exportToString()
+    return core.QARow(section, check, status, value, details)
+
+
+def _warn(qa_rows: List[core.QARow], section, check, value, message: str) -> None:
+    '''record a problem that does not block the release, in the QA report and the messages'''
+
+    arcpy.AddWarning(message)
+    qa_rows.append(_qa(section, check, core.QA_WARN, value, message))
 
 
 def _valid_spatial_reference(dataset, label: str):
     '''get a defined spatial reference or show a useful input error'''
 
     spatial_reference = getattr(arcpy.Describe(dataset), 'spatialReference', None)
-    if not spatial_reference or getattr(spatial_reference, 'name', 'Unknown') == 'Unknown':
+    if common.is_unknown_spatial_reference(spatial_reference):
         raise ValueError(
             f'{label} has an unknown coordinate system. Use Define Projection with the '
             'correct coordinate system, then run this tool again.'
@@ -117,16 +120,42 @@ def _field_lookup(dataset) -> Dict[str, object]:
     return {field.name.lower(): field for field in arcpy.ListFields(dataset)}
 
 
-def _resolved_fields(dataset, profile, required=True):
+def _is_user_field(field) -> bool:
+    '''check whether a field holds attribute values the tool can map'''
+
+    return (
+        field.type not in common.SYSTEM_FIELD_TYPES
+        and not getattr(field, 'required', False)
+        and getattr(field, 'editable', True)
+    )
+
+
+def _resolved_fields(dataset, profile, required=True, fields=None):
     '''match the pure python field rules back to ArcGIS field objects'''
 
-    fields = list(arcpy.ListFields(dataset))
+    fields = list(arcpy.ListFields(dataset) if fields is None else fields)
     definitions = core.resolve_role_fields(fields, profile, required)
     by_name = {field.name.casefold(): field for field in fields}
     return {
         role: by_name[definition.name.casefold()] if definition else None
         for role, definition in definitions.items()
     }
+
+
+def _resolved_source_fields(dataset, profile, fields=None):
+    '''match roles on the new data, allowing the profile's stand-in fields
+
+    returns the ArcGIS field for each role and {role: stand-in field name}
+    '''
+
+    fields = list(arcpy.ListFields(dataset) if fields is None else fields)
+    definitions, stand_ins = core.resolve_source_role_fields(fields, profile)
+    by_name = {field.name.casefold(): field for field in fields}
+    resolved = {
+        role: by_name[definition.name.casefold()] if definition else None
+        for role, definition in definitions.items()
+    }
+    return resolved, stand_ins
 
 
 def _gcs_code(spatial_reference):
@@ -137,30 +166,31 @@ def _gcs_code(spatial_reference):
 
 
 def _choose_transformation(
-    source_dataset,
-    source_sr,
-    target_sr,
-    requested: str,
-    label: str,
-):
-    '''validate or choose the best ArcGIS geographic transformation'''
+    dataset: _Dataset,
+    extent,
+    qa_rows: List[core.QARow],
+    allow_without_transformation: bool = False,
+) -> str:
+    '''validate or choose the best ArcGIS geographic transformation
 
-    if _same_spatial_reference(source_sr, target_sr):
-        if str(requested or '').strip():
+    the choice is recorded in the QA report, as a warning when the tool picked
+    it or when the new data has to be projected without one.
+    '''
+
+    label = dataset.label
+    requested = str(dataset.requested_transformation or '').strip()
+    if common.same_spatial_reference(dataset.source_sr, dataset.target_sr):
+        if requested:
             arcpy.AddWarning(
                 f'{label} already uses the target coordinate system; its transformation '
                 'selection will be ignored.'
             )
+        qa_rows.append(_qa(label, 'geographic_transformation', core.QA_PASS,
+                           'None required', 'New data already uses the target coordinate system.'))
         return ''
     available = list(
-        arcpy.ListTransformations(
-            source_sr,
-            target_sr,
-            getattr(arcpy.Describe(source_dataset), 'extent', None),
-        )
-        or []
+        arcpy.ListTransformations(dataset.source_sr, dataset.target_sr, extent) or []
     )
-    requested = str(requested or '').strip()
     if requested:
         exact = next((item for item in available if item.lower() == requested.lower()), None)
         if not exact:
@@ -169,22 +199,43 @@ def _choose_transformation(
                 f'The selected {label} geographic transformation {requested!r} is '
                 f'not valid for these datasets. Available choices: {choices}.'
             )
+        qa_rows.append(_qa(label, 'geographic_transformation', core.QA_PASS,
+                           exact, 'Chosen in the tool.'))
         return exact
     if available:
         selected = available[0]
-        arcpy.AddMessage(f'{label} will use geographic transformation: {selected}')
-        return selected
-    if _gcs_code(source_sr) != _gcs_code(target_sr):
-        source_gcs = getattr(getattr(source_sr, 'GCS', None), 'name', 'unknown')
-        target_gcs = getattr(getattr(target_sr, 'GCS', None), 'name', 'unknown')
-        target_name = getattr(target_sr, 'name', 'the target coordinate system')
-        raise ValueError(
-            f'ArcGIS has no geographic transformation from {source_gcs} to '
-            f'{target_gcs} covering the area of these {label} features, so this tool '
-            f'cannot project them safely. Run the ArcGIS Pro Project tool on the new '
-            f'data to convert them to {target_name} first, then choose the '
-            'projected layer here and run this tool again.'
+        _warn(
+            qa_rows, label, 'geographic_transformation', selected,
+            f'{label} will use geographic transformation {selected}, which ArcGIS Pro '
+            'recommends first for this area. If a different one is correct for this '
+            'data, choose it in the Geographic transformation column.',
         )
+        return selected
+    if _gcs_code(dataset.source_sr) != _gcs_code(dataset.target_sr):
+        source_gcs = getattr(getattr(dataset.source_sr, 'GCS', None), 'name', 'unknown')
+        target_gcs = getattr(getattr(dataset.target_sr, 'GCS', None), 'name', 'unknown')
+        if not allow_without_transformation:
+            target_name = getattr(dataset.target_sr, 'name', 'the target coordinate system')
+            raise ValueError(
+                f'ArcGIS has no geographic transformation from {source_gcs} to '
+                f'{target_gcs} covering the area of these {label} features, so this tool '
+                f'cannot project them safely. Run the ArcGIS Pro Project tool on the new '
+                f'data to convert them to {target_name} first, then choose the '
+                'projected layer here and run this tool again. To project them anyway, '
+                'check "Project without a datum transformation when ArcGIS has none" '
+                'under Options; positions may then shift.'
+            )
+        _warn(
+            qa_rows, label, 'geographic_transformation', 'None available',
+            f'ArcGIS has no geographic transformation from {source_gcs} to {target_gcs} '
+            f'for the {label} features, so they will be projected without one. '
+            'Positions may shift, typically by a few meters to a few hundred meters '
+            'depending on the datums. Check their placement against the production '
+            'layer during visual review.',
+        )
+        return ''
+    qa_rows.append(_qa(label, 'geographic_transformation', core.QA_PASS,
+                       'None required', 'Both coordinate systems use the same datum.'))
     return ''
 
 
@@ -272,23 +323,125 @@ def _assert_no_collisions(paths: Sequence[str]) -> None:
         )
 
 
-def _multipart_count(dataset) -> int:
-    '''count new features Mapbox cannot import because they have more than one part'''
+def _is_multipart(geometry) -> bool:
+    '''check whether a geometry has more than one part, which Mapbox cannot import'''
 
-    count = 0
-    with arcpy.da.SearchCursor(dataset, ['SHAPE@']) as rows:
-        for (geometry,) in rows:
-            if geometry is None:
+    if geometry is None:
+        return False
+    try:
+        return int(getattr(geometry, 'partCount', 1) or 1) > 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _scan_new_data(dataset: _Dataset, source_fields) -> None:
+    '''count multipart features and blank required values in one read of the new data
+
+    runs before any copying so a blank metadata box or a multipart feature fails
+    in seconds rather than after the production data has been staged.
+    '''
+
+    resolved, dataset.source_stand_ins = _resolved_source_fields(
+        dataset.new_input, dataset.profile, fields=source_fields
+    )
+    problems: List[str] = []
+    countable = []
+    for role in dataset.roles:
+        # an entered value fills every blank, so the source data cannot fall short
+        if not core.is_blank(dataset.fallbacks.get(role)):
+            continue
+        source_field = resolved.get(role)
+        if source_field is None:
+            aliases = ', '.join(
+                dataset.profile.aliases.get(role, ())
+                + dataset.profile.source_fallbacks.get(role, ())
+            )
+            problems.append(
+                f'{dataset.label}: no {role} field (accepted names: {aliases}) and no '
+                f'{role} value entered, so every feature would be missing it.'
+            )
+            continue
+        countable.append((role, source_field.name))
+
+    blanks = {role: 0 for role, _ in countable}
+    multipart = 0
+    total = 0
+    with arcpy.da.SearchCursor(
+        dataset.new_input, ['SHAPE@'] + [name for _, name in countable]
+    ) as rows:
+        for row in rows:
+            total += 1
+            if _is_multipart(row[0]):
+                multipart += 1
+            for index, (role, _) in enumerate(countable, start=1):
+                if core.is_blank(row[index]):
+                    blanks[role] += 1
+
+    for role, field_name in countable:
+        if blanks[role]:
+            problems.append(
+                f'{dataset.label}: {blanks[role]} of {total} features have a blank '
+                f'{field_name} and no {role} value was entered.'
+            )
+    dataset.multipart_count = multipart
+    dataset.missing_values = problems
+
+
+def _fill_and_spellcheck_values(dataset: _Dataset, qa_rows: List[core.QARow]) -> None:
+    '''fill a blank class or type from production, or spell-check a typed one
+
+    when the cell was left blank and every production feature shares one value,
+    that value fills the blanks on the new features so nobody has to guess it.
+    '''
+
+    checks = []
+    for role in core.SPELLCHECK_ROLES:
+        field_name = dataset.target_role_fields.get(role)
+        if field_name:
+            checks.append((role, field_name))
+    if not checks:
+        return
+
+    # one read of the production target covers every checked field
+    columns: List[List[object]] = [[] for _ in checks]
+    with arcpy.da.SearchCursor(
+        dataset.target_path, [field_name for _, field_name in checks]
+    ) as rows:
+        for row in rows:
+            for index, value in enumerate(row):
+                columns[index].append(value)
+
+    for (role, field_name), column in zip(checks, columns):
+        existing = core.distinct_text_values(column)
+        typed = dataset.fallbacks.get(role)
+        if core.is_blank(typed):
+            shared = core.shared_value(existing)
+            if shared is None:
                 continue
-            try:
-                if int(getattr(geometry, 'partCount', 1) or 1) > 1:
-                    count += 1
-            except (TypeError, ValueError):
-                continue
-    return count
+            dataset.fallbacks[role] = shared
+            arcpy.AddMessage(
+                f'{dataset.label}: every production feature has {field_name} '
+                f'{shared!r}, so it will fill blank {role} values on the new features.'
+            )
+            qa_rows.append(_qa(
+                dataset.label, f'{role}_autofill', core.QA_PASS, shared,
+                f'{role.capitalize()} was left blank and every production feature '
+                'uses this value, so it filled blanks on the new features.',
+            ))
+            continue
+        message = core.spellcheck_warning(
+            dataset.label, role, str(typed).strip(), existing
+        )
+        if message:
+            _warn(qa_rows, dataset.label, f'{role}_spellcheck', str(typed).strip(), message)
 
 
-def _validate_dataset(dataset: _Dataset) -> None:
+def _validate_dataset(
+    dataset: _Dataset,
+    qa_rows: List[core.QARow],
+    split_multipart: bool = False,
+    project_without_transformation: bool = False,
+) -> None:
     '''validate one complete target and its selected new features'''
 
     target_description = arcpy.Describe(dataset.target_input)
@@ -320,7 +473,7 @@ def _validate_dataset(dataset: _Dataset) -> None:
             )
         dataset.shape_type = target_shape
 
-    if any('.' in field.name for field in arcpy.ListFields(dataset.new_input)):
+    if common.joined_field_names(dataset.new_input):
         raise ValueError(
             f'The {dataset.label} new data has a joined table. Remove the join before '
             'running this tool so each source field can be mapped unambiguously.'
@@ -331,14 +484,17 @@ def _validate_dataset(dataset: _Dataset) -> None:
     dataset.target_path = str(
         getattr(target_description, 'catalogPath', dataset.target_input)
     )
+    dataset.new_catalog_path = str(
+        getattr(source_description, 'catalogPath', dataset.new_input)
+    )
     if os.path.splitext(dataset.target_path)[1].casefold() != '.shp':
         raise ValueError(
             f'The {dataset.label} target must be the current production shapefile (.shp). '
             'A geodatabase layer can contain longer field names or values that a shapefile '
             'would silently shorten, so it cannot safely define the release schema.'
         )
-    if _normalized_path(dataset.target_path) == _normalized_path(
-        getattr(source_description, 'catalogPath', dataset.new_input)
+    if common.normalized_path(dataset.target_path) == common.normalized_path(
+        dataset.new_catalog_path
     ):
         raise ValueError(
             f'The {dataset.label} target and new data must be different datasets.'
@@ -361,18 +517,6 @@ def _validate_dataset(dataset: _Dataset) -> None:
             f'The {dataset.label} new data contains no selected features. Select the '
             'intended features or clear the selection, then run the tool again.'
         )
-    multipart = _multipart_count(dataset.new_input)
-    if multipart:
-        raise ValueError(
-            f'{dataset.label}: {multipart} of {dataset.new_count} new features are '
-            'multipart. Mapbox cannot import multipart data. Run the Multipart To '
-            'Singlepart tool on the new data, then choose that result and run this '
-            'tool again.'
-        )
-    dataset.transformation = _choose_transformation(
-        dataset.new_input, dataset.source_sr, dataset.target_sr,
-        dataset.requested_transformation, dataset.label,
-    )
 
     dataset.target_fields = _field_lookup(dataset.target_path)
     resolved_target = _resolved_fields(
@@ -385,11 +529,44 @@ def _validate_dataset(dataset: _Dataset) -> None:
         core.validate_role_field(role, target_field)
         dataset.target_role_fields[role] = target_field.name
 
+    source_fields = list(arcpy.ListFields(dataset.new_input))
+    dataset.source_field_names = tuple(
+        field.name for field in source_fields if _is_user_field(field)
+    )
+    # fill blank class/type from production first, so the blank-value check sees it
+    _fill_and_spellcheck_values(dataset, qa_rows)
+    _scan_new_data(dataset, source_fields)
+    for role, stand_in in dataset.source_stand_ins.items():
+        target_name = dataset.target_role_fields.get(role, role)
+        arcpy.AddMessage(
+            f'{dataset.label}: the new data has no {target_name} field, so {role} '
+            f'values will come from its {stand_in} field.'
+        )
+        qa_rows.append(_qa(
+            dataset.label, f'{role}_source_field', core.QA_PASS, stand_in,
+            f'The new data has no {target_name} field, so {role} was taken from '
+            f'{stand_in}.',
+        ))
+    if dataset.multipart_count and not split_multipart:
+        raise ValueError(
+            f'{dataset.label}: {dataset.multipart_count} of {dataset.new_count} new '
+            'features are multipart. Mapbox cannot import multipart data. Check '
+            '"Split multipart features into single parts" under Options to split them '
+            'automatically, or run the Multipart To Singlepart tool on the new data, '
+            'then choose that result and run this tool again.'
+        )
+    dataset.transformation = _choose_transformation(
+        dataset,
+        getattr(source_description, 'extent', None),
+        qa_rows,
+        project_without_transformation,
+    )
+
 
 def _add_field_like(dataset, field) -> str:
     '''add a staging field that matches its production target field'''
 
-    field_type = _ADD_FIELD_TYPES.get(field.type)
+    field_type = common.ADD_FIELD_TYPES.get(field.type)
     if not field_type:
         raise ValueError(
             f'Field {field.name!r} uses unsupported ArcGIS type {field.type!r}.'
@@ -397,7 +574,7 @@ def _add_field_like(dataset, field) -> str:
     kwargs = {}
     if field.type == 'String':
         kwargs['field_length'] = field.length
-    elif field.type in _NUMERIC_FIELD_TYPES:
+    elif field.type in common.NUMERIC_FIELD_TYPES:
         precision = getattr(field, 'precision', None)
         scale = getattr(field, 'scale', None)
         if precision is not None:
@@ -415,69 +592,16 @@ def _compatible(source_field, target_field, allow_numeric_conversion=False) -> b
         return True
     return (
         allow_numeric_conversion
-        and source_field.type in _NUMERIC_FIELD_TYPES
-        and target_field.type in _NUMERIC_FIELD_TYPES
+        and source_field.type in common.NUMERIC_FIELD_TYPES
+        and target_field.type in common.NUMERIC_FIELD_TYPES
     )
 
 
-def _missing_required_values(dataset: _Dataset) -> List[str]:
-    '''report every required GIUM value the release cannot supply yet
+def _resolve_role_sources(dataset: _Dataset) -> None:
+    '''match every GIUM role to a staged field, adding the target field when missing'''
 
-    checked before any copying so a blank metadata box fails in seconds rather
-    than after the historical target has been copied and projected.
-    '''
-
-    resolved = _resolved_fields(dataset.new_input, dataset.profile, required=False)
-    problems: List[str] = []
-    countable = []
-    for role in dataset.roles:
-        # an entered value fills every blank, so the source data cannot fall short
-        if not core.is_blank(dataset.fallbacks.get(role)):
-            continue
-        source_field = resolved.get(role)
-        if source_field is None:
-            aliases = ', '.join(dataset.profile.aliases.get(role, ()))
-            problems.append(
-                f'{dataset.label}: no {role} field (accepted names: {aliases}) and no '
-                f'{role} value entered, so every feature would be missing it.'
-            )
-            continue
-        countable.append((role, source_field.name))
-
-    if not countable:
-        return problems
-
-    blanks = {role: 0 for role, _ in countable}
-    total = 0
-    with arcpy.da.SearchCursor(
-        dataset.new_input, [name for _, name in countable]
-    ) as rows:
-        for row in rows:
-            total += 1
-            for index, (role, _) in enumerate(countable):
-                if core.is_blank(row[index]):
-                    blanks[role] += 1
-
-    for role, field_name in countable:
-        if blanks[role]:
-            problems.append(
-                f'{dataset.label}: {blanks[role]} of {total} features have a blank '
-                f'{field_name} and no {role} value was entered.'
-            )
-    return problems
-
-
-def _prepare_role_fields(dataset: _Dataset) -> None:
-    '''add missing GIUM fields in staging and fill only blank values'''
-
-    source_fields = _field_lookup(dataset.staged_new)
-    resolved_source = _resolved_fields(dataset.staged_new, dataset.profile, required=False)
-    roles = list(dataset.managed_roles)
-    if not roles:
-        dataset.filled_counts = {}
-        return
-
-    for role in roles:
+    resolved_source, _ = _resolved_source_fields(dataset.staged_new, dataset.profile)
+    for role in dataset.managed_roles:
         target_field = dataset.target_fields[dataset.target_role_fields[role].lower()]
         source_field = resolved_source.get(role)
         if source_field and not _compatible(
@@ -491,12 +615,27 @@ def _prepare_role_fields(dataset: _Dataset) -> None:
         if not source_field:
             # add the target field to staging so an explicit FieldMap can use it
             _add_field_like(dataset.staged_new, target_field)
-            source_fields = _field_lookup(dataset.staged_new)
-            source_field = source_fields[target_field.name.lower()]
+            source_field = _field_lookup(dataset.staged_new)[target_field.name.lower()]
         dataset.source_role_fields[role] = source_field.name
 
-    cursor_fields = ['OID@'] + [dataset.source_role_fields[role] for role in roles]
+
+def _fill_role_values(dataset: _Dataset) -> None:
+    '''fill only blank GIUM values in staging and validate every final value
+
+    the rotation range for the QA report is collected in the same pass.
+    '''
+
+    roles = list(dataset.managed_roles)
     dataset.filled_counts = {role: 0 for role in roles}
+    if not roles:
+        return
+
+    target_fields = {
+        role: dataset.target_fields[dataset.target_role_fields[role].lower()]
+        for role in roles
+    }
+    cursor_fields = ['OID@'] + [dataset.source_role_fields[role] for role in roles]
+    low = high = None
     with arcpy.da.UpdateCursor(dataset.staged_new, cursor_fields) as rows:
         for row in rows:
             row = list(row)
@@ -505,24 +644,31 @@ def _prepare_role_fields(dataset: _Dataset) -> None:
             for index, role in enumerate(roles, start=1):
                 source_value = row[index]
                 fallback = dataset.fallbacks.get(role)
-                target_field = dataset.target_fields[
-                    dataset.target_role_fields[role].lower()
-                ]
                 value = core.resolved_role_value(
-                    role, source_value, fallback, target_field,
+                    role, source_value, fallback, target_fields[role],
                     required=role in dataset.roles,
                     context=f'feature {oid}',
                 )
                 if core.is_blank(source_value) and not core.is_blank(fallback):
                     dataset.filled_counts[role] += 1
                     changed = True
+                if role == 'rotation' and not core.is_blank(value):
+                    rotation = float(value)
+                    low = rotation if low is None else min(low, rotation)
+                    high = rotation if high is None else max(high, rotation)
                 row[index] = value
             if changed:
                 rows.updateRow(row)
+    if low is not None:
+        dataset.rotation_range = (low, high)
 
 
-def _build_field_mappings(dataset: _Dataset):
-    '''create explicit Append field mappings from new data to the target schema'''
+def _build_field_mappings(dataset: _Dataset) -> _FieldPlan:
+    '''create explicit Append field mappings from new data to the target schema
+
+    only production fields get a map, so helper fields a staging tool added,
+    such as the ORIG_FID from Multipart To Singlepart, never reach the release.
+    '''
 
     source_fields = _field_lookup(dataset.staged_new)
     role_by_target = {
@@ -530,19 +676,17 @@ def _build_field_mappings(dataset: _Dataset):
     }
     mappings = arcpy.FieldMappings()
     mapped = []
-    extra_text_mappings = []
-    for target_field in arcpy.ListFields(dataset.target_path):
-        if (
-            target_field.type in _SYSTEM_FIELD_TYPES
-            or getattr(target_field, 'required', False)
-            or not getattr(target_field, 'editable', True)
-        ):
+    mapped_sources = set()
+    extra_text = []
+    unfilled = []
+    for target_field in dataset.target_fields.values():
+        if not _is_user_field(target_field):
             continue
         role = role_by_target.get(target_field.name.lower())
         source_name = dataset.source_role_fields.get(role) if role else None
         if not source_name:
             same_name = source_fields.get(target_field.name.lower())
-            if same_name:
+            if same_name and same_name.name.casefold() not in dataset.tool_fields:
                 if not _compatible(same_name, target_field):
                     raise ValueError(
                         f'The {dataset.label} field {same_name.name} is type '
@@ -552,6 +696,7 @@ def _build_field_mappings(dataset: _Dataset):
                     )
                 source_name = same_name.name
         if not source_name:
+            unfilled.append(target_field.name)
             continue
         field_map = arcpy.FieldMap()
         field_map.addInputField(dataset.staged_new, source_name)
@@ -561,40 +706,73 @@ def _build_field_mappings(dataset: _Dataset):
         field_map.outputField = output_field
         mappings.addFieldMap(field_map)
         mapped.append(f'{source_name}->{target_field.name}')
+        mapped_sources.add(source_name.casefold())
         if role is None and target_field.type == 'String':
-            extra_text_mappings.append((source_name, target_field))
+            extra_text.append((source_name, target_field))
     if not mapped:
         raise ValueError(f'No compatible fields could be mapped for {dataset.label}.')
-    for source_name, target_field in extra_text_mappings:
-        with arcpy.da.SearchCursor(dataset.staged_new, ['OID@', source_name]) as rows:
-            for oid, value in rows:
+    unmapped = [
+        name for name in dataset.source_field_names
+        if name.casefold() not in mapped_sources
+    ]
+    arcpy.AddMessage(f'{dataset.label} field mapping: {", ".join(mapped)}')
+    return _FieldPlan(mappings, mapped, extra_text, unmapped, unfilled)
+
+
+def _check_new_features(dataset: _Dataset, extra_text) -> None:
+    '''check staged geometry and extra text values in one read of the new features
+
+    role values are validated while they are filled, so only the other text
+    fields need a length check here.
+    '''
+
+    text_fields = [source_name for source_name, _ in extra_text]
+    nulls = 0
+    with arcpy.da.SearchCursor(
+        dataset.staged_new, ['OID@', 'SHAPE@'] + text_fields
+    ) as rows:
+        for row in rows:
+            oid, geometry = row[0], row[1]
+            if geometry is None or getattr(geometry, 'isEmpty', False):
+                nulls += 1
+            for value, (_, target_field) in zip(row[2:], extra_text):
                 try:
                     core.validate_value_for_field(
                         value, target_field, target_field.name, allow_blank=True
                     )
                 except ValueError as error:
                     raise ValueError(f'Feature {oid}: {error}') from None
-    arcpy.AddMessage(f'{dataset.label} field mapping: {", ".join(mapped)}')
-    return mappings, mapped
+    if nulls:
+        raise ValueError(
+            f'Projection produced {nulls} empty {dataset.label} geometries. '
+            'Run Check Geometry on the source data and try again.'
+        )
 
 
-def _null_geometry_count(dataset) -> int:
-    '''count null or empty features in a dataset'''
+def _make_staging_root() -> str:
+    '''create the temporary staging folder on a local disk
 
-    count = 0
-    with arcpy.da.SearchCursor(dataset, ['SHAPE@']) as rows:
-        for (geometry,) in rows:
-            if geometry is None or getattr(geometry, 'isEmpty', False):
-                count += 1
-    return count
+    the output folder is often a network share, so everything is built in the
+    ArcGIS scratch folder (or the system temp folder) and only the finished
+    release files are copied across.
+    '''
+
+    # the scratch folder is not always set outside a geoprocessing session
+    scratch = getattr(getattr(arcpy, 'env', None), 'scratchFolder', None)
+    if scratch and os.path.isdir(str(scratch)) and os.access(str(scratch), os.W_OK):
+        try:
+            return tempfile.mkdtemp(prefix='gium_staging_', dir=str(scratch))
+        except OSError:
+            pass
+    return tempfile.mkdtemp(prefix='gium_staging_', dir=tempfile.gettempdir())
 
 
 def _remove_staging_root(staging_root: str) -> None:
     '''delete the temporary staging folder, waiting for ArcGIS to drop its locks
 
     ArcGIS releases file geodatabase locks a moment after the last tool finishes,
-    and over a network share that lag is long enough that a single attempt leaves
-    a hidden staging folder behind on every run.
+    and that lag is long enough (especially on a network drive) that a single
+    attempt leaves a staging folder behind on some runs.
     '''
 
     for attempt in range(5):
@@ -610,41 +788,85 @@ def _remove_staging_root(staging_root: str) -> None:
     )
 
 
-def _geometry_problems(dataset, output_table: str) -> Tuple[int, str]:
-    '''count real geometry defects and describe them
+def _geometry_defects(dataset, output_table: str) -> List[Tuple[Optional[int], str]]:
+    '''run Check Geometry and list the real defects as (feature id, problem)
 
     CheckGeometry also reports dataset-level conditions with a feature id of -1,
     such as the missing spatial index on a freshly copied staging shapefile.
-    Those are not geometry defects and must not block a release.
+    Those are not geometry defects and must not block a release. a defect whose
+    feature cannot be identified gets an id of None.
     '''
 
     arcpy.management.CheckGeometry(dataset, output_table, 'ESRI')
     total = _count(output_table)
     if not total:
-        return 0, ''
+        return []
     try:
         names = {field.name.upper() for field in arcpy.ListFields(output_table)}
     except Exception:
         names = set()
     wanted = [name for name in ('FEATURE_ID', 'PROBLEM') if name in names]
     if 'FEATURE_ID' not in wanted:
-        return total, ''
+        return [(None, 'unspecified problem')] * total
 
     defects = []
     with arcpy.da.SearchCursor(output_table, wanted) as rows:
         for row in rows:
             values = dict(zip(wanted, row))
-            feature_id = values.get('FEATURE_ID')
             try:
-                dataset_level = int(feature_id) < 0
+                feature_id = int(values.get('FEATURE_ID'))
             except (TypeError, ValueError):
-                dataset_level = False
-            if dataset_level:
+                feature_id = None
+            if feature_id is not None and feature_id < 0:
                 continue
-            defects.append('feature %s: %s' % (
-                feature_id, values.get('PROBLEM', 'unspecified problem')
-            ))
-    return len(defects), '; '.join(defects[:10])
+            defects.append((feature_id, values.get('PROBLEM') or 'unspecified problem'))
+    return defects
+
+
+def _defect_summary(defects) -> str:
+    '''describe the first few geometry defects for a message'''
+
+    return '; '.join(
+        f'feature {feature_id}: {problem}' if feature_id is not None else problem
+        for feature_id, problem in defects[:10]
+    )
+
+
+def _split_release_defects(dataset: _Dataset, defects):
+    '''split release geometry defects into (new feature defects, historical defects)
+
+    a shapefile numbers its records 0, 1, 2... in file order, CopyFeatures
+    writes the production records first, and Append adds the new ones after
+    them. so history should be FID 0 to historical_count - 1 and the new
+    features the last new_count FIDs. that layout is confirmed before relying
+    on it, and if it does not hold every defect is treated as new so nothing
+    slips through.
+    '''
+
+    expected = dataset.historical_count + dataset.new_count
+    count = 0
+    ordered = True
+    with arcpy.da.SearchCursor(dataset.staged_release, ['OID@']) as rows:
+        for index, (fid,) in enumerate(rows):
+            count += 1
+            if fid != index:
+                ordered = False
+                break
+    if not ordered or count != expected:
+        arcpy.AddWarning(
+            f'Could not confirm which {dataset.label} release features are new, so '
+            'every geometry problem is treated as blocking.'
+        )
+        return list(defects), []
+
+    new, historical = [], []
+    for defect in defects:
+        feature_id = defect[0]
+        if feature_id is not None and feature_id < dataset.historical_count:
+            historical.append(defect)
+        else:
+            new.append(defect)
+    return new, historical
 
 
 def _field_properties(field) -> Dict[str, object]:
@@ -653,7 +875,7 @@ def _field_properties(field) -> Dict[str, object]:
     properties: Dict[str, object] = {'type': field.type}
     if field.type == 'String':
         properties['length'] = getattr(field, 'length', None)
-    elif field.type in _NUMERIC_FIELD_TYPES:
+    elif field.type in common.NUMERIC_FIELD_TYPES:
         properties['precision'] = getattr(field, 'precision', None)
         properties['scale'] = getattr(field, 'scale', None)
     properties['nullable'] = getattr(field, 'isNullable', None)
@@ -665,7 +887,7 @@ def _schema_signature(dataset):
 
     signature = []
     for field in arcpy.ListFields(dataset):
-        if field.type in _SYSTEM_FIELD_TYPES or getattr(field, 'required', False):
+        if field.type in common.SYSTEM_FIELD_TYPES or getattr(field, 'required', False):
             continue
         signature.append((field.name.casefold(), _field_properties(field)))
     return signature
@@ -705,6 +927,99 @@ def _schema_differences(target_schema, release_schema) -> List[str]:
     return differences
 
 
+def _split_multipart(
+    dataset: _Dataset,
+    copied_new: str,
+    gdb: str,
+    qa_rows: List[core.QARow],
+) -> str:
+    '''split the staged copy of the new data into single parts
+
+    only the staging copy is split, never the source. every part keeps the
+    attributes of the feature it came from.
+    '''
+
+    split = os.path.join(gdb, f'row{dataset.index}_new_singlepart')
+    before = {field.name.casefold() for field in arcpy.ListFields(copied_new)}
+    arcpy.AddMessage(
+        f'Splitting {dataset.multipart_count:,} multipart {dataset.label} '
+        'features into single parts...'
+    )
+    arcpy.management.MultipartToSinglepart(copied_new, split)
+    # remember fields the tool added, such as ORIG_FID, so they are never mapped
+    dataset.tool_fields = {
+        field.name.casefold() for field in arcpy.ListFields(split)
+    } - before
+    dataset.original_new_count = dataset.new_count
+    dataset.new_count = _count(split)
+    if dataset.new_count < dataset.original_new_count:
+        raise ValueError(
+            f'Multipart To Singlepart returned fewer {dataset.label} features than it '
+            'was given. Check the new data for empty geometry and run the tool again.'
+        )
+    qa_rows.append(_qa(dataset.label, 'new_count_before_split', core.QA_PASS,
+                       dataset.original_new_count, 'Selected new features before splitting.'))
+    _warn(
+        qa_rows, dataset.label, 'multipart_split', dataset.new_count,
+        f'{dataset.label}: {dataset.multipart_count:,} multipart new features were '
+        f'split into single parts, so {dataset.original_new_count:,} selected features '
+        f'became {dataset.new_count:,}. Each part keeps its original attributes; '
+        'check them during visual review.',
+    )
+    return split
+
+
+def _verify_release(dataset: _Dataset, gdb: str, qa_rows: List[core.QARow]):
+    '''check the staged release shapefile before it can be packaged'''
+
+    label = dataset.label
+    release = dataset.staged_release
+    expected = dataset.historical_count + dataset.new_count
+    final_count = _count(release)
+    if final_count != expected:
+        raise ValueError(
+            f'{label} count check failed: expected {expected:,}, found '
+            f'{final_count:,}. No release files were published.'
+        )
+    release_sr = _valid_spatial_reference(release, f'Packaged {label}')
+    if not common.same_spatial_reference(release_sr, dataset.target_sr):
+        raise ValueError(f'Packaged {label} data has the wrong coordinate system.')
+    target_schema = _schema_signature(dataset.target_path)
+    release_schema = _schema_signature(release)
+    if release_schema != target_schema:
+        differences = _schema_differences(target_schema, release_schema)
+        detail = '; '.join(differences) or 'no individual difference could be isolated'
+        raise ValueError(
+            f'Packaged {label} schema does not match its production '
+            f'target: {detail}.'
+        )
+
+    # problems already in production are reported but only new ones block
+    problem_table = os.path.join(gdb, f'row{dataset.index}_release_geometry_problems')
+    defects = _geometry_defects(release, problem_table)
+    new_defects, historical_defects = (
+        _split_release_defects(dataset, defects) if defects else ([], [])
+    )
+    if new_defects:
+        detail = _defect_summary(new_defects)
+        raise ValueError(
+            f'ArcGIS found {len(new_defects)} geometry problem(s) on the new {label} '
+            'features after combining them with the production data. No release '
+            'files were published.'
+            + (f' Reported: {detail}.' if detail else '')
+        )
+    if historical_defects:
+        detail = _defect_summary(historical_defects)
+        _warn(
+            qa_rows, label, 'historical_geometry_problems', len(historical_defects),
+            f'{label}: the production target already has {len(historical_defects)} '
+            'geometry problem(s). They were copied into the release unchanged; repair '
+            'them in production when you can.'
+            + (f' Reported: {detail}.' if detail else ''),
+        )
+    return final_count, release_schema
+
+
 def _stage_dataset(
     dataset: _Dataset,
     gdb: str,
@@ -716,31 +1031,25 @@ def _stage_dataset(
     safe = f'row{dataset.index}'
     copied_new = os.path.join(gdb, f'{safe}_new_source')
     dataset.staged_new = os.path.join(gdb, f'{safe}_new_projected')
+    dataset.staged_release = os.path.join(release_dir, dataset.output_name)
 
-    # the historical copy and the combined output stay shapefiles: a file
-    # geodatabase round trip adds Shape_Length and widens dBASE numeric fields,
-    # which would publish a schema the production target does not have
-    work_dir = os.path.join(os.path.dirname(gdb), 'work')
-    os.makedirs(work_dir, exist_ok=True)
-    dataset.staged_target = os.path.join(work_dir, f'{safe}_historical.shp')
-    dataset.staged_output = os.path.join(work_dir, f'{safe}_complete.shp')
-
-    # copy the complete target but only the selected new records into staging
-    arcpy.AddMessage(f'Copying the complete historical {dataset.label} target...')
-    arcpy.management.CopyFeatures(dataset.target_path, dataset.staged_target)
+    # copy only the selected new records into staging
     arcpy.management.CopyFeatures(dataset.new_input, copied_new)
     if _count(copied_new) != dataset.new_count:
         raise ValueError(f'ArcGIS did not copy all selected new {dataset.label} features.')
+    working_new = copied_new
+    if dataset.multipart_count:
+        working_new = _split_multipart(dataset, copied_new, gdb, qa_rows)
 
     # project the new records into the target coordinate system before appending
-    if _same_spatial_reference(dataset.source_sr, dataset.target_sr):
-        arcpy.management.CopyFeatures(copied_new, dataset.staged_new)
+    if common.same_spatial_reference(dataset.source_sr, dataset.target_sr):
+        arcpy.management.CopyFeatures(working_new, dataset.staged_new)
     else:
         arcpy.AddMessage(
             f'Projecting new {dataset.label} features to the target coordinate system...'
         )
         kwargs = {
-            'in_dataset': copied_new,
+            'in_dataset': working_new,
             'out_dataset': dataset.staged_new,
             'out_coor_system': dataset.target_sr,
         }
@@ -751,141 +1060,92 @@ def _stage_dataset(
         raise ValueError(
             f'Projection changed the number of new {dataset.label} features.'
         )
-    nulls = _null_geometry_count(dataset.staged_new)
-    if nulls:
-        raise ValueError(
-            f'Projection produced {nulls} empty {dataset.label} geometries. '
-            'Run Check Geometry on the source data and try again.'
-        )
+
+    # map fields explicitly, then check and fill the new features before
+    # anything touches a copy of the production data
+    _resolve_role_sources(dataset)
+    plan = _build_field_mappings(dataset)
+    _check_new_features(dataset, plan.extra_text)
+    _fill_role_values(dataset)
     problem_table = os.path.join(gdb, f'{safe}_new_geometry_problems')
-    invalids, detail = _geometry_problems(dataset.staged_new, problem_table)
-    if invalids:
+    new_defects = _geometry_defects(dataset.staged_new, problem_table)
+    if new_defects:
+        detail = _defect_summary(new_defects)
         raise ValueError(
-            f'ArcGIS found {invalids} geometry problem(s) in the projected new '
+            f'ArcGIS found {len(new_defects)} geometry problem(s) in the projected new '
             f'{dataset.label} data. Repair the source geometry and run the tool again.'
             + (f' Reported: {detail}.' if detail else '')
         )
+    if plan.unmapped_new:
+        names = ', '.join(plan.unmapped_new)
+        _warn(
+            qa_rows, dataset.label, 'unmapped_new_fields', '; '.join(plan.unmapped_new),
+            f'{dataset.label}: these fields on the new data are not in the production '
+            f'target, so their values are left out of the release: {names}.',
+        )
+    if plan.unfilled_target:
+        names = ', '.join(plan.unfilled_target)
+        _warn(
+            qa_rows, dataset.label, 'unfilled_target_fields',
+            '; '.join(plan.unfilled_target),
+            f'{dataset.label}: these production fields have no matching field on the '
+            f'new data, so they are blank for the new features: {names}.',
+        )
 
-    # fill required fields, map them explicitly, and append to a copy of the target
-    _prepare_role_fields(dataset)
-    mappings, mapped = _build_field_mappings(dataset)
-    arcpy.management.CopyFeatures(dataset.staged_target, dataset.staged_output)
+    # copy history once, straight to the release shapefile, and append to it.
+    # the release stays a shapefile the whole way: a file geodatabase round trip
+    # adds Shape_Length and widens dBASE numeric fields, which would publish a
+    # schema the production target does not have
+    arcpy.AddMessage(f'Copying the complete historical {dataset.label} target...')
+    arcpy.management.CopyFeatures(dataset.target_path, dataset.staged_release)
     arcpy.AddMessage(f'Appending {dataset.new_count:,} new {dataset.label} features...')
-    arcpy.management.Append(dataset.staged_new, dataset.staged_output, 'NO_TEST', mappings)
-    final_count = _count(dataset.staged_output)
-    expected = dataset.historical_count + dataset.new_count
-    if final_count != expected:
-        raise ValueError(
-            f'{dataset.label} count check failed: expected {expected:,}, found '
-            f'{final_count:,}. No release files were published.'
-        )
-    if _null_geometry_count(dataset.staged_output):
-        raise ValueError(
-            f'The complete {dataset.label} output contains empty geometry.'
-        )
-    problem_table = os.path.join(gdb, f'{safe}_complete_geometry_problems')
-    invalids, detail = _geometry_problems(dataset.staged_output, problem_table)
-    if invalids:
-        raise ValueError(
-            f'ArcGIS found {invalids} geometry problem(s) after combining the '
-            f'{dataset.label} data. No release files were published.'
-            + (f' Reported: {detail}.' if detail else '')
-        )
-    output_sr = _valid_spatial_reference(
-        dataset.staged_output, f'Complete {dataset.label}'
+    arcpy.management.Append(
+        dataset.staged_new, dataset.staged_release, 'NO_TEST', plan.mappings
     )
-    if not _same_spatial_reference(output_sr, dataset.target_sr):
-        raise ValueError(
-            f'The complete {dataset.label} data has the wrong coordinate system.'
-        )
+    final_count, release_schema = _verify_release(dataset, gdb, qa_rows)
 
-    # create the final shapefile in staging and verify that its schema survived
-    dataset.staged_release = os.path.join(release_dir, dataset.output_name)
-    arcpy.management.CopyFeatures(dataset.staged_output, dataset.staged_release)
-    release_count = _count(dataset.staged_release)
-    release_sr = _valid_spatial_reference(
-        dataset.staged_release, f'Packaged {dataset.label}'
-    )
-    target_schema = _schema_signature(dataset.target_path)
-    release_schema = _schema_signature(dataset.staged_release)
-    if release_count != expected:
-        raise ValueError(
-            f'Packaged {dataset.label} count check failed: expected {expected:,}, '
-            f'found {release_count:,}.'
-        )
-    if not _same_spatial_reference(release_sr, dataset.target_sr):
-        raise ValueError(f'Packaged {dataset.label} data has the wrong coordinate system.')
-    if release_schema != target_schema:
-        differences = _schema_differences(target_schema, release_schema)
-        detail = '; '.join(differences) or 'no individual difference could be isolated'
-        raise ValueError(
-            f'Packaged {dataset.label} schema does not match its production '
-            f'target: {detail}.'
-        )
-    problem_table = os.path.join(gdb, f'{safe}_release_geometry_problems')
-    invalids, detail = _geometry_problems(dataset.staged_release, problem_table)
-    if invalids:
-        raise ValueError(
-            f'Packaged {dataset.label} data contains {invalids} geometry problem(s).'
-            + (f' Reported: {detail}.' if detail else '')
-        )
+    expected = dataset.historical_count + dataset.new_count
+    new_details = 'Selections and definition queries on the new layer were honored.'
+    if dataset.original_new_count:
+        new_details += ' Counted after splitting multipart features.'
     qa_rows.extend([
-        _qa(dataset.label, 'target_input_path', 'PASS', dataset.target_path,
+        _qa(dataset.label, 'target_input_path', core.QA_PASS, dataset.target_path,
             'Complete historical target; layer selections were ignored.'),
-        _qa(dataset.label, 'new_input_path', 'PASS',
-            str(getattr(arcpy.Describe(dataset.new_input), 'catalogPath', dataset.new_input)),
+        _qa(dataset.label, 'new_input_path', core.QA_PASS, dataset.new_catalog_path,
             'Selections and definition queries on this layer were honored.'),
-        _qa(
-            dataset.label,
-            'historical_count',
-            'PASS',
-            dataset.historical_count,
-            dataset.target_path,
-        ),
-        _qa(dataset.label, 'new_count', 'PASS', dataset.new_count,
-            'Selections and definition queries on the new layer were honored.'),
-        _qa(dataset.label, 'final_count', 'PASS', final_count, f'Expected {expected}.'),
-        _qa(dataset.label, 'target_spatial_reference', 'PASS',
+        _qa(dataset.label, 'historical_count', core.QA_PASS, dataset.historical_count,
+            dataset.target_path),
+        _qa(dataset.label, 'new_count', core.QA_PASS, dataset.new_count, new_details),
+        _qa(dataset.label, 'final_count', core.QA_PASS, final_count, f'Expected {expected}.'),
+        _qa(dataset.label, 'target_spatial_reference', core.QA_PASS,
             getattr(dataset.target_sr, 'name', ''), ''),
-        _qa(dataset.label, 'geographic_transformation', 'PASS',
-            dataset.transformation or 'None required', ''),
-        _qa(dataset.label, 'field_mapping', 'PASS', '; '.join(mapped), ''),
-        _qa(dataset.label, 'packaged_schema', 'PASS',
+        _qa(dataset.label, 'field_mapping', core.QA_PASS, '; '.join(plan.mapped), ''),
+        _qa(dataset.label, 'packaged_schema', core.QA_PASS,
             '; '.join(item[0] for item in release_schema),
             'Matches the selected production target.'),
-        _qa(dataset.label, 'enforced_roles', 'PASS',
+        _qa(dataset.label, 'enforced_roles', core.QA_PASS,
             ', '.join(dataset.roles) or 'none',
             'Required roles that exist on the production target.'),
     ])
     for role, count in dataset.filled_counts.items():
-        qa_rows.append(_qa(dataset.label, f'{role}_fallback_rows', 'PASS', count, ''))
+        qa_rows.append(_qa(dataset.label, f'{role}_fallback_rows', core.QA_PASS, count, ''))
         qa_rows.append(
             _qa(
                 dataset.label,
                 f'{role}_missing_rows',
-                'PASS',
+                core.QA_PASS,
                 0,
                 'Validated on every selected new feature.',
             )
         )
-    if 'rotation' in dataset.source_role_fields:
-        rotations = []
-        with arcpy.da.SearchCursor(
-            dataset.staged_new, [dataset.source_role_fields['rotation']]
-        ) as rows:
-            rotations = [float(value) for (value,) in rows]
+    if dataset.rotation_range:
+        low, high = dataset.rotation_range
         qa_rows.extend([
-            _qa(dataset.label, 'rotation_minimum', 'PASS', min(rotations),
+            _qa(dataset.label, 'rotation_minimum', core.QA_PASS, low,
                 'Selected new features.'),
-            _qa(dataset.label, 'rotation_maximum', 'PASS', max(rotations),
+            _qa(dataset.label, 'rotation_maximum', core.QA_PASS, high,
                 'Selected new features.'),
         ])
-
-
-def _qa(section, check, status, value, details):
-    '''make one row for the release QA report'''
-
-    return core.QARow(section, check, status, value, details)
 
 
 def _write_zip(staged_shapefile: str, zip_path: str) -> List[str]:
@@ -904,11 +1164,12 @@ def _write_zip(staged_shapefile: str, zip_path: str) -> List[str]:
 def _write_geojson(dataset: _Dataset, shapefile: str, geojson_path: str) -> None:
     '''write the WGS 84 GeoJSON Mapbox uses and confirm its feature count'''
 
-    arcpy.AddMessage(f'Creating formatted WGS 84 GeoJSON for {dataset.label}...')
+    # unformatted JSON is much smaller, which keeps the Mapbox upload quick
+    arcpy.AddMessage(f'Creating WGS 84 GeoJSON for {dataset.label}...')
     arcpy.conversion.FeaturesToJSON(
         shapefile,
         geojson_path,
-        'FORMATTED',
+        'NOT_FORMATTED',
         'NO_Z_VALUES',
         'NO_M_VALUES',
         'GEOJSON',
@@ -953,7 +1214,7 @@ def _package_dataset(
             _qa(
                 dataset.label,
                 'zip_members',
-                'PASS',
+                core.QA_PASS,
                 '; '.join(members),
                 'Files are stored at the ZIP root.',
             )
@@ -966,7 +1227,7 @@ def _package_dataset(
             _qa(
                 dataset.label,
                 'geojson',
-                'PASS',
+                core.QA_PASS,
                 f'WGS 84 / field names / {dataset.historical_count + dataset.new_count} features',
                 os.path.basename(staged_geojson),
             )
@@ -975,10 +1236,55 @@ def _package_dataset(
 
 
 def _write_qa(path: str, rows: Iterable[core.QARow]) -> None:
-    '''write the QA report with Excel-friendly UTF-8 encoding'''
+    '''write the QA report with Excel-friendly UTF-8 encoding
 
+    rows are grouped by section so each dataset reads as one block, even though
+    its preflight warnings were collected before any dataset was staged.
+    '''
+
+    rows = list(rows)
+    order: Dict[str, int] = {}
+    for row in rows:
+        order.setdefault(row.section, len(order))
+    rows.sort(key=lambda row: order[row.section])
     with open(path, 'w', newline='', encoding='utf-8-sig') as stream:
         stream.write(core.qa_csv_text(rows))
+
+
+def _write_failure_report(
+    output_folder,
+    release_date,
+    qa_rows: Sequence[core.QARow],
+    error: BaseException,
+) -> None:
+    '''leave a QA report explaining a failed run, without ever hiding the error
+
+    it is only written into a folder that already exists, and never beside a
+    finished release for the same date.
+    '''
+
+    try:
+        requested = str(output_folder or '').strip()
+        if not requested:
+            return
+        folder = os.path.abspath(requested)
+        if not os.path.isdir(folder):
+            return
+        if os.path.exists(core.qa_report_path(folder, release_date)):
+            return
+        path = core.qa_failure_report_path(folder, release_date)
+        rows = list(qa_rows) + [
+            _qa('Release', 'overall_result', core.QA_FAIL,
+                str(error) or type(error).__name__,
+                'No release files were published. Historical inputs were not changed.'),
+        ]
+        _write_qa(path, rows)
+        arcpy.AddMessage(f'QA report for the failed run: {path}')
+    except Exception as report_error:
+        try:
+            arcpy.AddWarning(f'Could not write the failure QA report: {report_error}')
+        except Exception:
+            pass
 
 
 def _copy_release_artifacts(sources: Sequence[str], output_folder: str) -> List[str]:
@@ -1004,18 +1310,30 @@ def _copy_release_artifacts(sources: Sequence[str], output_folder: str) -> List[
     return created
 
 
-def execute(
-    datasets,
+def _remove_old_failure_report(output_folder: str, release_date) -> None:
+    '''delete a failure report left by an earlier attempt at this release'''
+
+    path = core.qa_failure_report_path(output_folder, release_date)
+    if not os.path.exists(path):
+        return
+    try:
+        os.remove(path)
+    except OSError as error:
+        arcpy.AddWarning(f'Could not remove the old failure report {path}: {error}')
+
+
+def _build_release(
+    rows,
     herd_name,
     country,
     release_date,
     output_folder,
-):
-    '''build and safely publish a complete GIUM release from one or more datasets'''
+    qa_rows: List[core.QARow],
+    split_multipart: bool,
+    project_without_transformation: bool,
+) -> IntegrationResult:
+    '''validate every dataset, stage the release, and publish it all at once'''
 
-    rows = core.parse_dataset_rows(datasets)
-    if not rows:
-        raise ValueError('Add at least one dataset to the table.')
     output_folder = _validate_output_folder(output_folder)
     items = []
     for index, row in enumerate(rows, start=1):
@@ -1044,7 +1362,7 @@ def execute(
     # all checks above and below this point are read-only
     arcpy.AddMessage('Checking inputs before creating release files...')
     for item in items:
-        _validate_dataset(item)
+        _validate_dataset(item, qa_rows, split_multipart, project_without_transformation)
         _assign_artifact_paths(item, output_folder, release_date)
 
     folded_names = [item.output_name.casefold() for item in items]
@@ -1060,7 +1378,7 @@ def execute(
 
     missing_values = []
     for item in items:
-        missing_values.extend(_missing_required_values(item))
+        missing_values.extend(item.missing_values)
     if missing_values:
         raise ValueError(
             'Required GIUM values are missing. Enter the value in the tool to fill '
@@ -1070,37 +1388,17 @@ def execute(
 
     # make sure an unusual output path cannot replace an input
     source_paths = [item.target_path for item in items]
-    source_paths += [
-        str(
-            getattr(
-                arcpy.Describe(item.new_input),
-                'catalogPath',
-                item.new_input,
-            )
-        )
-        for item in items
-    ]
-    if {_normalized_path(path) for path in planned} & {
-        _normalized_path(path) for path in source_paths
+    source_paths += [item.new_catalog_path for item in items]
+    if {common.normalized_path(path) for path in planned} & {
+        common.normalized_path(path) for path in source_paths
     }:
         raise ValueError('A release output path cannot replace an input dataset.')
 
     # create temporary staging only after every dataset passes preflight
     output_folder = _validate_output_folder(output_folder, create=True)
-    staging_root = tempfile.mkdtemp(prefix='.gium_arrow_staging_', dir=output_folder)
+    staging_root = _make_staging_root()
     release_dir = os.path.join(staging_root, 'release')
     os.mkdir(release_dir)
-    stamp = core.release_stamp(release_date)
-    qa_rows = [
-        _qa('Release', 'release_date', 'PASS', stamp, ''),
-        _qa(
-            'Release',
-            'atomic_mode',
-            'PASS',
-            'Enabled',
-            'All datasets must pass before files are published.',
-        ),
-    ]
     published = []
     try:
         gdb_result = arcpy.management.CreateFileGDB(staging_root, 'staging.gdb')
@@ -1133,24 +1431,32 @@ def execute(
                 _qa(
                     'Release',
                     'artifact_path',
-                    'PASS',
+                    core.QA_PASS,
                     path,
                     'Final release artifact.',
                 )
             )
+        warnings = core.qa_warning_count(qa_rows)
         qa_rows.append(
             _qa(
                 'Release',
                 'overall_result',
-                'PASS',
-                'Ready for visual review',
-                'Historical inputs were not changed.',
+                core.QA_PASS,
+                core.qa_overall_result(qa_rows),
+                'Ready for visual review. Historical inputs were not changed.',
             )
         )
         _write_qa(staged_qa, qa_rows)
         promotion_sources.append(staged_qa)
         published = _copy_release_artifacts(promotion_sources, output_folder)
-        arcpy.AddMessage('GIUM release created successfully.')
+        _remove_old_failure_report(output_folder, release_date)
+        if warnings:
+            arcpy.AddMessage(
+                f'GIUM release created with {warnings} warning'
+                f'{"" if warnings == 1 else "s"}. Review the WARN rows in the QA report.'
+            )
+        else:
+            arcpy.AddMessage('GIUM release created successfully.')
         for path in result.created + [result.qa_csv]:
             arcpy.AddMessage(f'Created: {path}')
         arcpy.AddMessage(
@@ -1170,3 +1476,51 @@ def execute(
         raise
     finally:
         _remove_staging_root(staging_root)
+
+
+def execute(
+    datasets,
+    herd_name,
+    country,
+    release_date,
+    output_folder,
+    split_multipart=False,
+    project_without_transformation=False,
+):
+    '''build and safely publish a complete GIUM release from one or more datasets
+
+    split_multipart and project_without_transformation turn two preflight
+    errors into automatic fixes, each reported as a QA warning. when the run
+    fails, a _QA_FAILED.csv report is left in an existing output folder.
+    '''
+
+    rows = core.parse_dataset_rows(datasets)
+    if not rows:
+        raise ValueError('Add at least one dataset to the table.')
+    split_multipart = bool(split_multipart)
+    project_without_transformation = bool(project_without_transformation)
+    stamp = core.release_stamp(release_date)
+    qa_rows = [
+        _qa('Release', 'release_date', core.QA_PASS, stamp, ''),
+        _qa(
+            'Release',
+            'atomic_mode',
+            core.QA_PASS,
+            'Enabled',
+            'All datasets must pass before files are published.',
+        ),
+        _qa('Release', 'split_multipart', core.QA_PASS,
+            'Yes' if split_multipart else 'No',
+            'Split multipart features into single parts.'),
+        _qa('Release', 'project_without_transformation', core.QA_PASS,
+            'Yes' if project_without_transformation else 'No',
+            'Project without a datum transformation when ArcGIS has none.'),
+    ]
+    try:
+        return _build_release(
+            rows, herd_name, country, release_date, output_folder, qa_rows,
+            split_multipart, project_without_transformation,
+        )
+    except Exception as error:
+        _write_failure_report(output_folder, release_date, qa_rows, error)
+        raise

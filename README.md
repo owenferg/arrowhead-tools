@@ -1,13 +1,13 @@
 # Arrowhead Tools
 
-An ArcGIS Pro Python toolbox that creates arrowhead points from line endpoints or rotates existing arrowhead points to match nearby lines. It was created to assist the data pipeline of CMS's Global Atlas of Ungulate Migration interactive web map, via the InfoGraphics Lab at the University of Oregon. Created by Owen Ferguson.
+An ArcGIS Pro Python toolbox that creates and rotates arrowhead points for arrow lines, and merges new line, point, or polygon data into the existing GIUM layers as dated, Mapbox-ready releases. It was created to assist the data pipeline of CMS's Global Atlas of Ungulate Migration interactive web map, via the InfoGraphics Lab at the University of Oregon. Created by Owen Ferguson.
 
 ## Download
 
 [Download the latest ArcGIS Pro toolbox](https://github.com/owenferg/arrowhead-tools/releases/latest/)
 
 Extract the ZIP, then add `arrow_tools.pyt` to the ArcGIS Pro Catalog pane.
-Keep all six extracted Python files in the same folder.
+Keep all of the extracted files in the same folder.
 
 ## Requirements
 
@@ -19,20 +19,22 @@ No third-party Python packages are required.
 
 ## Install
 
-Keep the six Python files in `toolbox/` together:
+Keep the files in `toolbox/` together:
 
 - `arrow_tools.pyt`
+- `arcpy_common.py`
 - `arrow_creation_arcpy.py`
 - `arrow_rotation_arcpy.py`
 - `arrow_rotation_core.py`
 - `gium_integration_arcpy.py`
 - `gium_integration_core.py`
+- `arrowhead_symbology.lyrx`
 
 In ArcGIS Pro, add `arrow_tools.pyt` to the Catalog pane. The toolbox includes three tools:
 
-- **Create Arrowheads from Line Endpoints** creates a new arrowhead point layer when you only have lines.
+- **Create Arrowheads from Line Endpoints** creates a new arrowhead point layer when you only have lines. The new layer is added to the map with its arrowhead symbol and rotation already set up.
 - **Update Existing Arrowhead Rotations** updates arrowhead points that already exist.
-- **Integrate Data into Existing GIUM Layers** creates safe, dated copies of existing GIUM production layers from new line, point, or polygon data.
+- **Integrate Data into Existing GIUM Layers** creates safe, dated copies of existing GIUM production layers from new line, point, or polygon data, along with a QA report that flags anything worth checking before uploading to Mapbox.
 
 ## Test
 
@@ -47,5 +49,7 @@ Run the ArcGIS smoke test from the ArcGIS Pro Python window or an authorized Pyt
 ```python
 exec(open(r"C:\path\to\arrowhead-tools\tests\arcgis_pro_smoke_test.py").read())
 ```
+
+Tests also run automatically on GitHub for every push. Pushing a version tag (such as `v1.6`) builds the toolbox ZIP and creates a draft release for it, so all that's left is writing the release notes and publishing.
 
 The smoke test creates disposable geodatabase and shapefile data, exercises all three tools, and checks selections, complete-history preservation, projection coordinates, field precedence, packaging, rollback, buffered rotations, and audit outputs before removing the temporary data.

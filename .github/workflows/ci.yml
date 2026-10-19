@@ -1,0 +1,62 @@
+# runs the tests that don't need ArcGIS Pro on every push, and builds the
+# toolbox zip as a draft GitHub release whenever a version tag (v1.6, etc) is pushed
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # ArcGIS Pro only runs on Windows, so test there with the Python versions Pro ships
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Check the toolbox compiles
+        run: python -m py_compile toolbox/arrow_tools.pyt (Get-ChildItem toolbox/*.py).FullName
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+  release:
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build toolbox zip
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          zip_name="arrowhead-tools-toolbox-${version}.zip"
+          # only ship the toolbox itself, not bytecode or ArcGIS metadata
+          zip -r "$zip_name" toolbox -i 'toolbox/*.py' 'toolbox/*.pyt' 'toolbox/*.lyrx' 'toolbox/README.txt'
+          unzip -l "$zip_name"
+          echo "ZIP_NAME=$zip_name" >> "$GITHUB_ENV"
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ZIP_NAME" \
+            --draft \
+            --title "Arrowhead Tools $GITHUB_REF_NAME" \
+            --generate-notes

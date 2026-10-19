@@ -81,6 +81,8 @@ class ToolboxContractTests(unittest.TestCase):
         arcpy = types.ModuleType("arcpy")
         arcpy.Parameter = Parameter
         arcpy.AddError = lambda message: None
+        arcpy.AddMessage = lambda message: None
+        arcpy.AddWarning = lambda message: None
         def describe(value):
             path = pathlib.Path(str(value))
             is_geodatabase = str(path).lower().endswith(".gdb")
@@ -279,6 +281,48 @@ class ToolboxContractTests(unittest.TestCase):
             str(self.project_workspace / "Roads_Arrowheads"),
         )
 
+    def test_creation_output_uses_arrowhead_symbology_for_the_output_field(self):
+        tool = self.toolbox.CreateArrowheadsFromLineEndpoints()
+        parameters = tool.getParameterInfo()
+        template = PACKAGE / "arrowhead_symbology.lyrx"
+        self.assertEqual(pathlib.Path(parameters[5].symbology), template)
+        self.assertTrue(template.is_file())
+
+        for parameter, value in zip(
+            parameters, ["lines", "END", None, "Rotation", "0", "arrowheads"]
+        ):
+            parameter.value = value
+        # the tool reports a renamed field when the requested one was taken
+        self.toolbox.arcpy.env.scratchFolder = self.temp_directory.name
+        self.toolbox.arrow_creation_arcpy.execute = lambda *args, **kwargs: "Rotation_1"
+
+        tool.execute(parameters, None)
+
+        written = pathlib.Path(parameters[5].symbology)
+        self.assertEqual(written.parent, pathlib.Path(self.temp_directory.name))
+        self.assertIn("$feature.Rotation_1", written.read_text(encoding="utf-8"))
+
+    def test_creation_symbology_problems_only_warn(self):
+        tool = self.toolbox.CreateArrowheadsFromLineEndpoints()
+        parameters = tool.getParameterInfo()
+        warnings = []
+        self.toolbox.arcpy.AddWarning = warnings.append
+        self.toolbox.arrow_creation_arcpy.execute = lambda *args, **kwargs: "Rotation"
+
+        def broken_symbology(*args):
+            raise OSError("disk full")
+
+        self.toolbox.arrow_creation_arcpy.arrowhead_symbology = broken_symbology
+
+        tool.execute(parameters, None)
+
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("disk full", warnings[0])
+        self.assertIn("Rotation field", warnings[0])
+        self.assertEqual(
+            pathlib.Path(parameters[5].symbology), PACKAGE / "arrowhead_symbology.lyrx"
+        )
+
     def test_parameter_order_and_execute_forwarding(self):
         parameters = self.toolbox.RotateArrowheads().getParameterInfo()
         self.assertEqual(
@@ -319,9 +363,24 @@ class ToolboxContractTests(unittest.TestCase):
                 "country",
                 "release_date",
                 "output_folder",
+                "split_multipart",
+                "project_without_transformation",
                 "created_files",
                 "qa_csv",
             ],
+        )
+        self.assertEqual(
+            [parameter.category for parameter in parameters],
+            ["1. Datasets"] + ["2. Shared metadata"] * 4 + ["3. Options"] * 2
+            + ["4. Created release"] * 2,
+        )
+        for option in parameters[5:7]:
+            self.assertEqual(option.datatype, "GPBoolean")
+            self.assertEqual(option.parameterType, "Optional")
+            self.assertIs(option.value, False)
+        self.assertEqual(
+            [parameter.parameterType for parameter in parameters[7:]],
+            ["Derived", "Derived"],
         )
         self.assertEqual(parameters[0].datatype, "GPValueTable")
         self.assertEqual(
@@ -343,7 +402,7 @@ class ToolboxContractTests(unittest.TestCase):
         self.assertEqual(parameters[0].filters[6].list, [
             "Zipped shapefile", "GeoJSON", "Both",
         ])
-        self.assertTrue(parameters[5].multiValue)
+        self.assertTrue(parameters[7].multiValue)
 
         rows = [[
             "Seasonal arrows",
@@ -360,10 +419,11 @@ class ToolboxContractTests(unittest.TestCase):
         parameters[2].value = "Test Country"
         parameters[3].value = "2026-08-04"
         parameters[4].value = "/release"
+        parameters[5].value = True
 
         forwarded = []
-        self.toolbox.gium_integration_arcpy.execute = lambda *args: (
-            forwarded.append(args)
+        self.toolbox.gium_integration_arcpy.execute = lambda *args, **kwargs: (
+            forwarded.append((args, kwargs))
             or {
                 "created": ["/release/lines.shp", "/release/lines.zip"],
                 "qa_csv": "/release/qa.csv",
@@ -373,10 +433,102 @@ class ToolboxContractTests(unittest.TestCase):
 
         self.assertEqual(
             forwarded,
-            [(rows, "Test Herd", "Test Country", "2026-08-04", "/release")],
+            [(
+                (rows, "Test Herd", "Test Country", "2026-08-04", "/release"),
+                {"split_multipart": True, "project_without_transformation": False},
+            )],
         )
-        self.assertEqual(parameters[5].value, ["/release/lines.shp", "/release/lines.zip"])
-        self.assertEqual(parameters[6].value, "/release/qa.csv")
+        self.assertEqual(parameters[7].value, ["/release/lines.shp", "/release/lines.zip"])
+        self.assertEqual(parameters[8].value, "/release/qa.csv")
+
+    def _run_gium_with_map(self, active_map):
+        tool = self.toolbox.IntegrateGIUMData()
+        parameters = tool.getParameterInfo()
+        parameters[0].values = [[
+            "Seasonal arrows", "old_lines.shp", "new_lines", "", "", "", "", "",
+        ]]
+        parameters[3].value = "2026-08-04"
+        parameters[4].value = "/release"
+        self.toolbox.gium_integration_arcpy.execute = lambda *args, **kwargs: {
+            "created": ["/release/lines.shp", "/release/lines.zip", "/release/points.shp"],
+            "qa_csv": "/release/qa.csv",
+        }
+        self.toolbox.arcpy.mp = types.SimpleNamespace(
+            ArcGISProject=lambda project: types.SimpleNamespace(activeMap=active_map)
+        )
+        messages, warnings = [], []
+        self.toolbox.arcpy.AddMessage = messages.append
+        self.toolbox.arcpy.AddWarning = warnings.append
+        tool.execute(parameters, None)
+        return messages, warnings
+
+    def test_gium_release_shapefiles_are_added_to_the_active_map(self):
+        added = []
+        active_map = types.SimpleNamespace(name="Migration Arrows", addDataFromPath=added.append)
+        messages, warnings = self._run_gium_with_map(active_map)
+        # only the shapefiles go on the map, not the ZIP package
+        self.assertEqual(added, ["/release/lines.shp", "/release/points.shp"])
+        self.assertIn("Added lines.shp to the Migration Arrows map.", messages)
+        self.assertEqual(warnings, [])
+
+    def test_gium_release_without_an_open_map_only_leaves_a_message(self):
+        messages, warnings = self._run_gium_with_map(None)
+        self.assertTrue(any("No map is open" in message for message in messages))
+        self.assertEqual(warnings, [])
+
+    def test_gium_map_problem_warns_without_failing_the_release(self):
+        def refuse(path):
+            raise RuntimeError("layer locked")
+
+        active_map = types.SimpleNamespace(name="Migration Arrows", addDataFromPath=refuse)
+        messages, warnings = self._run_gium_with_map(active_map)
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("layer locked", warnings[0])
+
+    def test_gium_messages_reuse_arcpy_lookups_for_unchanged_rows(self):
+        tool = self.toolbox.IntegrateGIUMData()
+        parameters = tool.getParameterInfo()
+        target = str(pathlib.Path(self.temp_directory.name) / "SeasonalArrows.shp")
+        parameters[0].values = [[
+            "Seasonal arrows", target, "new_lines.shp", "", "", "", "", "",
+        ]]
+        parameters[3].value = "2026-08-04"
+        parameters[4].value = str(pathlib.Path(self.temp_directory.name))
+        describe = self.toolbox.arcpy.Describe
+        described = []
+        transformations = []
+
+        def counting_describe(value):
+            described.append(str(value))
+            return types.SimpleNamespace(
+                spatialReference=types.SimpleNamespace(name="SR", factoryCode=0),
+                extent=None,
+                **vars(describe(value)),
+            )
+
+        self.toolbox.arcpy.Describe = counting_describe
+        self.toolbox.arcpy.ListTransformations = lambda source, target, extent: (
+            transformations.append(1) or []
+        )
+
+        tool.updateMessages(parameters)
+        first_describes = len(described)
+        self.assertGreater(first_describes, 0)
+        self.assertEqual(len(transformations), 1)
+        self.assertIsNone(parameters[0].error)
+
+        for _unused in range(3):
+            tool.updateMessages(parameters)
+        self.assertEqual(len(described), first_describes)
+        self.assertEqual(len(transformations), 1)
+
+        # a changed row is looked up again
+        parameters[0].values = [[
+            "Seasonal arrows", target, "other_lines.shp", "", "", "", "", "",
+        ]]
+        tool.updateMessages(parameters)
+        self.assertIn("other_lines.shp", described)
+        self.assertEqual(len(transformations), 2)
 
     def test_gium_messages_require_table_rows(self):
         tool = self.toolbox.IntegrateGIUMData()
@@ -453,6 +605,95 @@ class ToolboxContractTests(unittest.TestCase):
 
         self.assertIn("fence", parameters[0].warning)
         self.assertIn("Fence, Railway", parameters[0].warning)
+
+    def _seasonal_arrows_form(self, class_cell, production_classes):
+        tool = self.toolbox.IntegrateGIUMData()
+        parameters = tool.getParameterInfo()
+        target = str(pathlib.Path(self.temp_directory.name) / "SeasonalArrows.shp")
+        pathlib.Path(target).write_text("placeholder")
+        parameters[0].values = [[
+            "Seasonal arrows", target, "new_lines", class_cell, "", "", "", "",
+        ]]
+        parameters[4].value = str(pathlib.Path(self.temp_directory.name))
+        self.toolbox.arcpy.ListFields = lambda dataset: [
+            types.SimpleNamespace(name="Class", type="String")
+        ]
+
+        class DistinctCursor:
+            def __enter__(self):
+                return iter([(value,) for value in production_classes])
+
+            def __exit__(self, *unused):
+                return False
+
+        self.toolbox.arcpy.da.SearchCursor = lambda dataset, fields: DistinctCursor()
+        tool.updateParameters(parameters)
+        return parameters[0].values[0]
+
+    def test_gium_blank_class_fills_from_shared_production_value(self):
+        row = self._seasonal_arrows_form(
+            "", ["Seasonal Movement", "Seasonal Movement", None]
+        )
+        self.assertEqual(row[3], "Seasonal Movement")
+        # seasonal arrows have no type role, so that cell stays blank
+        self.assertEqual(row[4], "")
+
+    def test_gium_class_fill_edits_one_cell_and_keeps_the_target_layer(self):
+        tool = self.toolbox.IntegrateGIUMData()
+        parameters = tool.getParameterInfo()
+        target = str(pathlib.Path(self.temp_directory.name) / "SeasonalArrows.shp")
+        pathlib.Path(target).write_text("placeholder")
+        target_layer = object()  # stands in for a map layer that can't round-trip
+
+        class ValueTable:
+            '''arcpy.ValueTable stand-in that records single-cell edits'''
+
+            def __init__(self):
+                self.edits = []
+
+            def setValue(self, row, column, value):
+                self.edits.append((row, column, value))
+
+        table = ValueTable()
+        parameters[0].value = table
+        parameters[0].values = [[
+            "Seasonal arrows", target_layer, "new_lines", "", "", "", "", "",
+        ]]
+        written = []
+        original_values = parameters[0].values
+
+        self.toolbox.arcpy.ListFields = lambda dataset: [
+            types.SimpleNamespace(name="Class", type="String")
+        ]
+
+        class DistinctCursor:
+            def __enter__(self):
+                return iter([("Seasonal Movement",)])
+
+            def __exit__(self, *unused):
+                return False
+
+        self.toolbox.arcpy.da.SearchCursor = lambda dataset, fields: DistinctCursor()
+        self.toolbox.arcpy.Describe = lambda dataset: types.SimpleNamespace(
+            catalogPath=target
+        )
+        self.toolbox._default_release_folder = lambda *datasets: written.append(datasets)
+
+        tool.updateParameters(parameters)
+
+        self.assertEqual(table.edits, [(0, 3, "Seasonal Movement")])
+        self.assertIs(parameters[0].value, table)
+        # the table rows were never rewritten, so the target layer cell survives
+        self.assertIs(parameters[0].values, original_values)
+        self.assertIs(parameters[0].values[0][1], target_layer)
+
+    def test_gium_typed_class_is_never_replaced(self):
+        row = self._seasonal_arrows_form("Migration", ["Seasonal Movement"])
+        self.assertEqual(row[3], "Migration")
+
+    def test_gium_class_is_not_filled_when_production_values_differ(self):
+        row = self._seasonal_arrows_form("", ["Fence", "Railway"])
+        self.assertEqual(row[3], "")
 
     def test_gium_spellcheck_does_not_warn_on_new_season(self):
         tool = self.toolbox.IntegrateGIUMData()

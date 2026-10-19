@@ -3,38 +3,25 @@ arcpy adapter for creating arrowheads from line endpoints
 '''
 
 from __future__ import annotations
-import math
+import json
 import os
+import re
+import tempfile
 from typing import Dict, Iterator, List, Optional, Tuple
 import arcpy  # pyright: ignore[reportMissingImports]
+import arcpy_common as common
 from arrow_rotation_core import clockwise_angle_from_east, endpoints_from_part
 
 
-_NUMERIC_FIELD_TYPES = {'Double', 'Single', 'Integer', 'SmallInteger', 'BigInteger'}
-_CUSTOM_FIELD_TYPES = {'SmallInteger', 'Integer', 'BigInteger', 'String'}
-_SKIPPED_FIELD_TYPES = {'OID', 'Geometry', 'Blob', 'Raster', 'GlobalID'}
-_ADD_FIELD_TYPES = {
-    'SmallInteger': 'SHORT',
-    'Integer': 'LONG',
-    'BigInteger': 'BIGINTEGER',
-    'Single': 'FLOAT',
-    'Double': 'DOUBLE',
-    'String': 'TEXT',
-    'Date': 'DATE',
-    'DateOnly': 'DATEONLY',
-    'TimeOnly': 'TIMEONLY',
-    'TimestampOffset': 'TIMESTAMPOFFSET',
-    'Guid': 'GUID',
-    'GUID': 'GUID',
-}
+_CUSTOM_FIELD_TYPES = common.INTEGER_FIELD_TYPES | {'String'}
 
-
-def _same_spatial_reference(first, second) -> bool:
-    '''check if two spatial references are the same'''
-
-    if first.factoryCode and second.factoryCode:
-        return first.factoryCode == second.factoryCode
-    return first.exportToString() == second.exportToString()
+# the symbology template points its rotation at this field, users can swap the lyrx for their own
+SYMBOLOGY_TEMPLATE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'arrowhead_symbology.lyrx'
+)
+_TEMPLATE_ROTATION = re.compile(
+    r'''\$feature\.Rotation\b|\$feature\[\s*(["'])Rotation\1\s*\]''', re.IGNORECASE
+)
 
 
 def _working_spatial_reference(line_layer):
@@ -42,7 +29,7 @@ def _working_spatial_reference(line_layer):
 
     spatial_reference = arcpy.Describe(line_layer).spatialReference
 
-    if not spatial_reference or spatial_reference.name == 'Unknown':
+    if common.is_unknown_spatial_reference(spatial_reference):
         raise ValueError('Lines must have a defined spatial reference')
 
     if spatial_reference.type == 'Geographic':
@@ -52,31 +39,6 @@ def _working_spatial_reference(line_layer):
         )
         return spatial_reference, arcpy.SpatialReference(3857)
     return spatial_reference, spatial_reference
-
-
-def _projection_for_layer(layer, target_spatial_reference):
-    '''get the transformation for a layer to a target spatial reference'''
-
-    description = arcpy.Describe(layer)
-    source = description.spatialReference
-
-    if _same_spatial_reference(source, target_spatial_reference):
-        return None
-
-    transformations = arcpy.ListTransformations(
-        source, target_spatial_reference, description.extent
-    )
-    return transformations[0] if transformations else ''
-
-
-def _project_if_needed(geometry, spatial_reference, transformation=None):
-    '''project a geometry to a target spatial reference if needed'''
-
-    if _same_spatial_reference(geometry.spatialReference, spatial_reference):
-        return geometry
-    if transformation:
-        return geometry.projectAs(spatial_reference, transformation)
-    return geometry.projectAs(spatial_reference)
 
 
 def _parts(geometry) -> Iterator[List[object]]:
@@ -113,24 +75,6 @@ def _parse_custom_value(value) -> bool:
     raise ValueError(f'{value!r} is not a supported Boolean value')
 
 
-def _parse_rotation_buffer(value) -> float:
-    '''validate the clockwise rotation buffer'''
-
-    try:
-        rotation_buffer = float(value)
-    except (TypeError, ValueError):
-        raise ValueError('Rotation buffer must be a number') from None
-    if not math.isfinite(rotation_buffer):
-        raise ValueError('Rotation buffer must be a finite number')
-    return rotation_buffer
-
-
-def _normalized_path(value) -> str:
-    '''normalize a catalog path for safe comparisons'''
-
-    return os.path.normcase(os.path.normpath(str(value))).replace('\\', '/').lower()
-
-
 def _validate_output(line_layer, output: str) -> Tuple[str, str]:
     '''validate the output path without changing anything'''
 
@@ -141,7 +85,7 @@ def _validate_output(line_layer, output: str) -> Tuple[str, str]:
         raise ValueError('Output arrowheads must include a workspace and feature class name')
 
     input_path = arcpy.Describe(line_layer).catalogPath
-    if _normalized_path(input_path) == _normalized_path(output):
+    if common.normalized_path(input_path) == common.normalized_path(output):
         raise ValueError('Output arrowheads cannot replace the input lines')
     return workspace, name
 
@@ -164,11 +108,11 @@ def _source_fields(line_layer) -> List[object]:
     fields = []
     for field in arcpy.ListFields(line_layer):
         if (
-            field.type not in _SKIPPED_FIELD_TYPES
+            field.type not in common.SYSTEM_FIELD_TYPES
             and getattr(field, 'editable', True)
             and not getattr(field, 'required', False)
         ):
-            if field.type not in _ADD_FIELD_TYPES:
+            if field.type not in common.ADD_FIELD_TYPES:
                 arcpy.AddWarning(f'Skipped unsupported source field {field.name} ({field.type})')
                 continue
             fields.append(field)
@@ -183,7 +127,7 @@ def _validate_line_layer(line_layer) -> None:
         raise ValueError('Input lines must be a polyline layer')
     if not getattr(description, 'hasOID', True):
         raise ValueError('Input lines must have an Object ID field')
-    if any('.' in field.name for field in arcpy.ListFields(line_layer)):
+    if common.joined_field_names(line_layer):
         raise ValueError('Joined line layers are not supported; remove the join and run the tool again')
 
 
@@ -242,7 +186,7 @@ def _validate_rotation_field(line_layer, output: str, rotation_field: str) -> st
         None,
     )
     if matching_input_field and (
-        matching_input_field.type in _SKIPPED_FIELD_TYPES
+        matching_input_field.type in common.SYSTEM_FIELD_TYPES
         or not getattr(matching_input_field, 'editable', True)
         or getattr(matching_input_field, 'required', False)
     ):
@@ -252,7 +196,7 @@ def _validate_rotation_field(line_layer, output: str, rotation_field: str) -> st
         (field for field in _source_fields(line_layer) if field.name.lower() == valid.lower()),
         None,
     )
-    if source_rotation and source_rotation.type not in _NUMERIC_FIELD_TYPES:
+    if source_rotation and source_rotation.type not in common.NUMERIC_FIELD_TYPES:
         raise ValueError('Existing rotation field must be numeric')
     return valid
 
@@ -263,7 +207,7 @@ def _add_source_field(output, output_name: str, field) -> None:
     kwargs = {}
     if field.type == 'String' and getattr(field, 'length', None):
         kwargs['field_length'] = field.length
-    if field.type in _NUMERIC_FIELD_TYPES:
+    if field.type in common.NUMERIC_FIELD_TYPES:
         if getattr(field, 'precision', None):
             kwargs['field_precision'] = field.precision
         if getattr(field, 'scale', None):
@@ -271,7 +215,7 @@ def _add_source_field(output, output_name: str, field) -> None:
     alias = getattr(field, 'aliasName', None)
     if alias:
         kwargs['field_alias'] = alias
-    arcpy.management.AddField(output, output_name, _ADD_FIELD_TYPES[field.type], **kwargs)
+    arcpy.management.AddField(output, output_name, common.ADD_FIELD_TYPES[field.type], **kwargs)
 
 
 def _create_schema(line_layer, output: str, rotation_field: str):
@@ -340,6 +284,53 @@ def _point_geometry(point, spatial_reference, has_z: bool, has_m: bool):
     return arcpy.PointGeometry(point, spatial_reference, has_z, has_m)
 
 
+def symbology_with_rotation_field(document, rotation_field: str):
+    '''point every $feature.Rotation expression in a layer document at another field
+
+    returns the updated document and how many expressions were changed
+    '''
+
+    replacement = f'$feature.{rotation_field}'
+    count = 0
+
+    def update(value):
+        nonlocal count
+        if isinstance(value, dict):
+            return {key: update(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [update(item) for item in value]
+        if isinstance(value, str):
+            # a function keeps backslashes in the field name from being read as escapes
+            updated, changed = _TEMPLATE_ROTATION.subn(lambda unused: replacement, value)
+            count += changed
+            return updated
+        return value
+
+    return update(document), count
+
+
+def arrowhead_symbology(rotation_field: str, template: str = SYMBOLOGY_TEMPLATE) -> str:
+    '''write a copy of the symbology template that rotates by the output field'''
+
+    with open(template, encoding='utf-8') as file:
+        document = json.load(file)
+
+    document, count = symbology_with_rotation_field(document, rotation_field)
+    if not count:
+        raise ValueError(f'{os.path.basename(template)} has no $feature.Rotation expression')
+
+    # the scratch folder is not always set outside a geoprocessing session
+    folder = getattr(getattr(arcpy, 'env', None), 'scratchFolder', None)
+    if not folder or not os.path.isdir(folder):
+        folder = tempfile.gettempdir()
+
+    safe_name = re.sub(r'\W', '_', rotation_field)
+    path = os.path.join(folder, f'arrowhead_symbology_{safe_name}.lyrx')
+    with open(path, 'w', encoding='utf-8') as file:
+        json.dump(document, file, indent=2)
+    return path
+
+
 def execute(
     line_layer,
     placement: str,
@@ -347,18 +338,22 @@ def execute(
     rotation_buffer,
     output: str,
     custom_field=None,
-) -> None:
-    '''create outward-facing arrowhead points from selected/input lines'''
+) -> str:
+    '''create outward-facing arrowhead points from selected/input lines
+
+    returns the output rotation field name, which can differ from the requested
+    name when it collides with a copied field
+    '''
 
     placement = _parse_placement(placement)
-    rotation_buffer = _parse_rotation_buffer(rotation_buffer)
+    rotation_buffer = common.parse_rotation_buffer(rotation_buffer)
     description = arcpy.Describe(line_layer)
 
     _validate_line_layer(line_layer)
     custom_field = _validate_custom_field(line_layer, placement, custom_field)
 
     source_spatial_reference, working_spatial_reference = _working_spatial_reference(line_layer)
-    transformation = _projection_for_layer(line_layer, working_spatial_reference)
+    transformation = common.projection_for_layer(line_layer, working_spatial_reference)
     _validate_output(line_layer, output)
     _validate_rotation_field(line_layer, output, rotation_field)
 
@@ -428,7 +423,9 @@ def execute(
                     degenerate_count += 1
                     continue
 
-                working_geometry = _project_if_needed(
+                # the output keeps the source coordinates, so only a copy is projected, and
+                # only for geographic lines since projected lines already are the working sr
+                working_geometry = common.project_if_needed(
                     geometry, working_spatial_reference, transformation
                 )
                 if getattr(working_geometry, 'hasCurves', False):
@@ -489,6 +486,7 @@ def execute(
             arcpy.AddWarning(f'Skipped {closed_count:,} closed line part(s)')
         if degenerate_count:
             arcpy.AddWarning(f'Skipped {degenerate_count:,} empty or degenerate line part(s)')
+        return rotation_output
 
     except Exception:
         if output_started and arcpy.Exists(output):

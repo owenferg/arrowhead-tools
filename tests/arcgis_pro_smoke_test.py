@@ -345,7 +345,24 @@ def _run_gium_integration_smoke(folder: str, geodatabase: str) -> None:
         qa_rows = list(csv.DictReader(stream))
     assert qa_rows, "QA report is empty"
     assert {"section", "check", "status", "value", "details"} <= set(qa_rows[0])
-    assert any(row["check"] == "overall_result" for row in qa_rows), qa_rows
+    overall = next(row for row in qa_rows if row["check"] == "overall_result")
+    assert overall["value"].startswith("PASS"), overall
+    # the Part 1 tracing fields and NewID are reported as left out, ExistingID as unfilled
+    unmapped = {
+        row["section"]: row["value"].lower()
+        for row in qa_rows if row["check"] == "unmapped_new_fields"
+    }
+    assert "source_oid" in unmapped.get("Row 2 GIUM point labels", ""), unmapped
+    assert any(
+        row["check"] == "unfilled_target_fields" and "existingid" in row["value"].lower()
+        for row in qa_rows
+    ), qa_rows
+    assert all(row["status"] in {"PASS", "WARN"} for row in qa_rows), qa_rows
+
+    # staging happens in the scratch folder, so the release folder holds only files
+    assert not [path for path in pathlib.Path(release_folder).iterdir() if path.is_dir()]
+    # unformatted GeoJSON is written on a single line
+    assert point_geojson.read_text(encoding="utf-8").strip().count("\n") == 0
 
     # a point validation failure after line staging should publish neither branch
     with arcpy.da.UpdateCursor(new_points, ["NewID", "Rotation"]) as rows:
@@ -396,14 +413,133 @@ def _run_gium_integration_smoke(folder: str, geodatabase: str) -> None:
     assert not list(
         failed_release_folder.glob("GIUMIntegration_January3_2026_QA.csv")
     )
+    failed_report = failed_release_folder / "GIUMIntegration_January3_2026_QA_FAILED.csv"
+    assert failed_report.exists(), list(failed_release_folder.iterdir())
+    with failed_report.open(newline="", encoding="utf-8-sig") as stream:
+        failed_rows = list(csv.DictReader(stream))
+    assert any(
+        row["check"] == "overall_result" and row["status"] == "FAIL"
+        and "360" in row["value"]
+        for row in failed_rows
+    ), failed_rows
     assert _count(line_target) == before_line_count
     assert _count(point_target) == before_point_count
+
+    # multipart new data fails by default and is split in staging when asked
+    multipart_lines = str(pathlib.Path(geodatabase) / "new_multipart_lines")
+    arcpy.management.CopyFeatures(line_layer, multipart_lines)
+    with arcpy.da.UpdateCursor(multipart_lines, ["SHAPE@"]) as rows:
+        for (unused_shape,) in rows:
+            rows.updateRow((
+                arcpy.Polyline(
+                    arcpy.Array([
+                        arcpy.Array([arcpy.Point(10.0, 45.0), arcpy.Point(10.01, 45.01)]),
+                        arcpy.Array([arcpy.Point(10.02, 45.02), arcpy.Point(10.03, 45.03)]),
+                    ]),
+                    source_sr,
+                ),
+            ))
+    multipart_row = [
+        "Seasonal arrows", line_target, multipart_lines,
+        "Migration", "", "Spring migration", "", "",
+    ]
+    split_folder = pathlib.Path(folder) / "gium_split_release"
+    try:
+        gium_integration_arcpy.execute(
+            [multipart_row], "Smoke Test Herd", "Kazakhstan",
+            datetime.datetime(2026, 1, 4), str(split_folder),
+        )
+    except ValueError as error:
+        assert "Split multipart features" in str(error), error
+    else:
+        raise AssertionError("Multipart new data unexpectedly produced a GIUM release")
+    assert not split_folder.exists()
+
+    split_result = gium_integration_arcpy.execute(
+        [multipart_row], "Smoke Test Herd", "Kazakhstan",
+        datetime.datetime(2026, 1, 4), str(split_folder),
+        split_multipart=True,
+    )
+    split_output = _created_file(split_result, "SeasonalArrowsMerged_January4_2026.shp")
+    assert _count(str(split_output)) == before_line_count + 2
+    assert _field_names(str(split_output)) == before_line_fields
+    assert _count(multipart_lines) == 1
+    with arcpy.da.SearchCursor(str(split_output), ["SHAPE@"]) as rows:
+        assert all(shape.partCount == 1 for (shape,) in rows)
+    with pathlib.Path(split_result.qa_csv).open(newline="", encoding="utf-8-sig") as stream:
+        split_qa = {row["check"]: row for row in csv.DictReader(stream)}
+    assert split_qa["multipart_split"]["status"] == "WARN", split_qa
+    assert split_qa["new_count_before_split"]["value"] == "1", split_qa
+
+    # a geometry problem already in production is a warning, not a failure.
+    # this also confirms that history keeps FIDs 0..n-1 in the release shapefile
+    damaged_target = str(target_folder / "seasonal_damaged.shp")
+    arcpy.management.CopyFeatures(line_target, damaged_target)
+    with arcpy.da.InsertCursor(
+        damaged_target, ["SHAPE@", "HerdName", "Country", "Season", "Class", "ExistingID"]
+    ) as rows:
+        rows.insertRow((None, "Broken herd", "Canada", "Winter", "Migration", 3))
+    damaged_folder = pathlib.Path(folder) / "gium_damaged_release"
+    damaged_result = gium_integration_arcpy.execute(
+        [["Seasonal arrows", damaged_target, line_layer,
+          "Migration", "", "Spring migration", "", ""]],
+        "Smoke Test Herd", "Kazakhstan",
+        datetime.datetime(2026, 1, 5), str(damaged_folder),
+    )
+    damaged_output = _created_file(damaged_result, "SeasonalArrowsMerged_January5_2026.shp")
+    assert _count(str(damaged_output)) == 4
+    with pathlib.Path(damaged_result.qa_csv).open(newline="", encoding="utf-8-sig") as stream:
+        damaged_qa = {row["check"]: row for row in csv.DictReader(stream)}
+    historical = damaged_qa["historical_geometry_problems"]
+    assert historical["status"] == "WARN" and historical["value"] == "1", historical
+    assert "feature 2" in historical["details"], historical
+    assert damaged_qa["overall_result"]["value"].startswith("PASS with"), damaged_qa
 
     arcpy.management.Delete(line_layer)
     arcpy.management.Delete(point_layer)
     arcpy.management.Delete(line_target_layer)
     arcpy.management.Delete(point_target_layer)
     arcpy.management.Delete(failed_point_layer)
+
+def _run_arrow_projection_and_symbology_smoke(geodatabase: str, points: str, lines: str) -> None:
+    '''geographic inputs go through the cursor projection, and the lyrx must open in Pro'''
+
+    geographic_points = str(pathlib.Path(geodatabase) / "arrowheads_wgs84")
+    geographic_lines = str(pathlib.Path(geodatabase) / "lines_wgs84")
+    arcpy.management.Project(points, geographic_points, arcpy.SpatialReference(4326))
+    arcpy.management.Project(lines, geographic_lines, arcpy.SpatialReference(4326))
+    # a big integer rotation field is accepted by the rotation tool too
+    arcpy.management.AddField(geographic_points, "rotation_big", "BIGINTEGER")
+
+    arrow_rotation_arcpy.execute(
+        geographic_points, geographic_lines, "2 Meters", "rotation_big", None
+    )
+    rotations = [
+        value for (value,) in arcpy.da.SearchCursor(
+            geographic_points, ["rotation_big"], sql_clause=(None, "ORDER BY OBJECTID")
+        )
+    ]
+    # the round trip through wgs 84 can land a hair under 360, so compare around the circle
+    assert rotations[2] is None, rotations
+    for value, expected in zip(rotations[:2], (0, 180)):
+        difference = abs(value - expected) % 360
+        assert min(difference, 360 - difference) <= 1, rotations
+
+    # the template has to be a layer file Pro can read, with the rotation pointed at a field
+    template = PACKAGE / "arrowhead_symbology.lyrx"
+    layer = arcpy.mp.LayerFile(str(template)).listLayers()[0]
+    definition = layer.getDefinition("V3")
+    rotation = definition.renderer.visualVariables[0]
+    assert rotation.rotationTypeZ == "Geographic", rotation.rotationTypeZ
+    assert rotation.visualVariableInfoZ.valueExpressionInfo.expression == "$feature.Rotation"
+
+    created = str(pathlib.Path(geodatabase) / "created_renamed_symbology")
+    rotation_field = arrow_creation_arcpy.execute(lines, "END", "Angle", "0", created)
+    assert rotation_field == "Angle", rotation_field
+    symbology = arrow_creation_arcpy.arrowhead_symbology(rotation_field)
+    created_layer = arcpy.management.MakeFeatureLayer(created, "created_symbology_layer")
+    arcpy.management.ApplySymbologyFromLayer(created_layer, symbology)
+    arcpy.management.Delete("created_symbology_layer")
 
 def run() -> None:
     spatial_reference = arcpy.SpatialReference(3857)
@@ -512,6 +648,7 @@ def run() -> None:
             ((0.0, 0.0), 183.0, "START", 1),
         ], custom_both_rows
 
+        _run_arrow_projection_and_symbology_smoke(geodatabase, points, lines)
         _run_gium_integration_smoke(folder, geodatabase)
 
         arcpy.management.ClearWorkspaceCache()

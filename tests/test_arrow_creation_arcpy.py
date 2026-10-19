@@ -3,9 +3,11 @@ unit tests for arrow_creation_arcpy.py without requiring an ArcGIS Pro license
 '''
 
 import importlib
+import json
 import os
 import pathlib
 import sys
+import tempfile
 import types
 import unittest
 
@@ -262,7 +264,9 @@ class ArrowCreationTests(unittest.TestCase):
         )
 
     def test_end_creates_one_outward_arrowhead_per_part(self):
-        self.tool.execute(self.lines, 'END', 'Rotation', '3', self.output)
+        rotation_field = self.tool.execute(self.lines, 'END', 'Rotation', '3', self.output)
+
+        self.assertEqual(rotation_field, 'Rotation')
 
         rows = self.arcpy.datasets[self.output].rows
         self.assertEqual(len(rows), 2)
@@ -495,6 +499,15 @@ class ArrowCreationTests(unittest.TestCase):
         self.assertEqual(fields['AssetGuid'], 'Guid')
         self.assertEqual(self.arcpy.datasets[self.output].rows[0]['AssetGuid'], '{ABC}')
 
+    def test_renamed_rotation_output_field_is_returned(self):
+        # shapefile style input, so OBJECTID is only taken in the new output
+        self.arcpy.datasets[self.lines].fields[0].name = 'FID'
+
+        rotation_field = self.tool.execute(self.lines, 'END', 'OBJECTID', 3, self.output)
+
+        self.assertEqual(rotation_field, 'OBJECTID_1')
+        self.assertEqual(self.arcpy.datasets[self.output].rows[0]['OBJECTID_1'], 3)
+
     def test_invalid_working_linear_units_are_rejected_before_overwrite(self):
         self.sr.metersPerUnit = 0
         existing = Dataset(self.output, self.sr, [{'keep': True}], [], 'Point')
@@ -504,6 +517,90 @@ class ArrowCreationTests(unittest.TestCase):
             self.tool.execute(self.lines, 'END', 'Rotation', 3, self.output)
 
         self.assertIs(self.arcpy.datasets[self.output], existing)
+
+
+class ArrowheadSymbologyTests(unittest.TestCase):
+    def setUp(self):
+        self.arcpy = build_fake_arcpy()
+        sys.modules['arcpy'] = self.arcpy
+        sys.modules.pop('arrow_creation_arcpy', None)
+        self.tool = importlib.import_module('arrow_creation_arcpy')
+        self.temp_directory = tempfile.TemporaryDirectory()
+        self.arcpy.env.scratchFolder = self.temp_directory.name
+
+    def tearDown(self):
+        self.temp_directory.cleanup()
+
+    @staticmethod
+    def _rotation_variables(document):
+        renderer = document['layerDefinitions'][0]['renderer']
+        return [
+            variable for variable in renderer.get('visualVariables', [])
+            if variable['type'] == 'CIMRotationVisualVariable'
+        ]
+
+    def test_template_is_a_layer_document_that_rotates_by_rotation(self):
+        self.assertEqual(
+            pathlib.Path(self.tool.SYMBOLOGY_TEMPLATE), PACKAGE / 'arrowhead_symbology.lyrx'
+        )
+        with open(self.tool.SYMBOLOGY_TEMPLATE, encoding='utf-8') as file:
+            document = json.load(file)
+
+        self.assertEqual(document['type'], 'CIMLayerDocument')
+        layer = document['layerDefinitions'][0]
+        self.assertEqual(layer['type'], 'CIMFeatureLayer')
+        self.assertEqual(document['layers'], [layer['uRI']])
+        self.assertEqual(layer['renderer']['type'], 'CIMSimpleRenderer')
+
+        symbol = layer['renderer']['symbol']['symbol']
+        self.assertEqual(symbol['type'], 'CIMPointSymbol')
+        marker = symbol['symbolLayers'][0]
+        self.assertEqual(marker['type'], 'CIMVectorMarker')
+        # the tip is the only point on the +x side, so the marker points east unrotated
+        ring = marker['markerGraphics'][0]['geometry']['rings'][0]
+        self.assertEqual(max(ring), [4, 0])
+        self.assertTrue(all(x < 0 for x, y in ring if [x, y] != [4, 0]))
+
+        [rotation] = self._rotation_variables(document)
+        self.assertEqual(rotation['rotationTypeZ'], 'Geographic')
+        z_info = rotation['visualVariableInfoZ']
+        self.assertEqual(z_info['visualVariableInfoType'], 'Expression')
+        self.assertEqual(z_info['valueExpressionInfo']['expression'], '$feature.Rotation')
+
+    def test_rotation_expressions_are_pointed_at_another_field(self):
+        document = {
+            'a': '$feature.Rotation',
+            'b': ['return $feature.ROTATION + 0', "$feature['Rotation']", '$feature["Rotation"]'],
+            'c': {'d': '$feature.Rotation_2', 'e': 5},
+        }
+
+        updated, count = self.tool.symbology_with_rotation_field(document, 'MapAngle')
+
+        self.assertEqual(count, 4)
+        self.assertEqual(updated['a'], '$feature.MapAngle')
+        self.assertEqual(
+            updated['b'],
+            ['return $feature.MapAngle + 0', '$feature.MapAngle', '$feature.MapAngle'],
+        )
+        # other fields that only start with Rotation are left alone
+        self.assertEqual(updated['c'], {'d': '$feature.Rotation_2', 'e': 5})
+
+    def test_symbology_copy_is_written_to_the_scratch_folder(self):
+        path = self.tool.arrowhead_symbology('Rotation_1')
+
+        self.assertEqual(pathlib.Path(path).parent, pathlib.Path(self.temp_directory.name))
+        with open(path, encoding='utf-8') as file:
+            document = json.load(file)
+        z_info = self._rotation_variables(document)[0]['visualVariableInfoZ']
+        self.assertEqual(z_info['expression'], '$feature.Rotation_1')
+        self.assertEqual(z_info['valueExpressionInfo']['expression'], '$feature.Rotation_1')
+
+    def test_template_without_a_rotation_expression_is_rejected(self):
+        template = pathlib.Path(self.temp_directory.name) / 'custom.lyrx'
+        template.write_text(json.dumps({'type': 'CIMLayerDocument'}), encoding='utf-8')
+
+        with self.assertRaisesRegex(ValueError, 'no \\$feature.Rotation'):
+            self.tool.arrowhead_symbology('Rotation', str(template))
 
 
 if __name__ == '__main__':

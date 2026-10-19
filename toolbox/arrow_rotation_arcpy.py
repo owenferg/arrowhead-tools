@@ -3,11 +3,13 @@ arcpy adapter for the arrowhead rotation tool
 '''
 
 from __future__ import annotations
+from contextlib import ExitStack, contextmanager
 from dataclasses import replace
 import math
 import os
 from typing import Dict, Iterator, List, Optional, Tuple
 import arcpy  # pyright: ignore[reportMissingImports]
+import arcpy_common as common
 from arrow_rotation_core import (
     Endpoint,
     EndpointIndex,
@@ -55,7 +57,7 @@ def _working_spatial_reference(point_layer) -> arcpy.SpatialReference:
 
     spatial_reference = arcpy.Describe(point_layer).spatialReference
 
-    if not spatial_reference or spatial_reference.name == "Unknown":
+    if common.is_unknown_spatial_reference(spatial_reference):
         raise ValueError('Arrowhead points must have a defined spatial reference')
 
     if spatial_reference.type == "Geographic":
@@ -78,52 +80,24 @@ def _tolerance_in_working_units(text: str, spatial_reference) -> float:
 
     return meters / meters_per_unit
 
-def _same_spatial_reference(first, second) -> bool:
-    '''check if two spatial references are the same, return bool'''
+@contextmanager
+def _projected_rows(layer, fields: List[str], spatial_reference):
+    '''open a search cursor that hands back shapes in the working spatial reference
 
-    if first.factoryCode and second.factoryCode:
-        return first.factoryCode == second.factoryCode
-    
-    return first.exportToString() == second.exportToString()
+    the cursor projects every shape itself, which is much faster than calling
+    projectAs on each row. a datum transformation can only reach the cursor
+    through the environment, so it is set just while the cursor is open.
+    '''
 
-def _projection_for_layer(layer, target_spatial_reference):
-    '''get the projection for a layer to a target spatial reference'''
+    # raises for an unknown spatial reference before anything is read
+    transformation = common.projection_for_layer(layer, spatial_reference)
 
-    description = arcpy.Describe(layer) # get layer desc from arcpy
-    source = description.spatialReference 
-
-    if not source or source.name == 'Unknown':
-        # if not a defined spatial ref
-        raise ValueError('All input layers have a defined spatial reference')
-    
-    if _same_spatial_reference(source, target_spatial_reference):
-        return None # if same spatial ref, no projection needed
-
-    # list all transformations between source and target
-    transformations = arcpy.ListTransformations(
-        source, target_spatial_reference, description.extent
-    )
-
-    # return first transformation if it exists 
-    return transformations[0] if transformations else ''
-
-def _project_if_needed(geometry, spatial_reference, transformation=None):
-    '''project a geometry to a target spatial reference if needed'''
-
-    source = geometry.spatialReference
-
-    if not source or source.name == 'Unknown':
-        raise ValueError('All input geometries must have a defined spatial reference')
-
-    if _same_spatial_reference(source, spatial_reference):
-        # if same spatial ref, no projection needed
-        return geometry
-
-    if transformation:
-        # if transformation is provided, use it
-        return geometry.projectAs(spatial_reference, transformation)
-
-    return geometry.projectAs(spatial_reference)
+    with ExitStack() as stack:
+        if transformation:
+            stack.enter_context(arcpy.EnvManager(geographicTransformations=transformation))
+        yield stack.enter_context(
+            arcpy.da.SearchCursor(layer, fields, spatial_reference=spatial_reference)
+        )
 
 def _parts(geometry) -> Iterator[List[Tuple[float, float]]]:
     '''iterate over the parts of a geometry and return the points'''
@@ -138,17 +112,13 @@ def _read_endpoints(line_layer, spatial_reference, tangent_distance: float) -> L
     '''read the endpoints from a line layer'''
 
     endpoints: List[Endpoint] = []
-    # get the transformation for the line layer
-    transformation = _projection_for_layer(line_layer, spatial_reference)
 
-    with arcpy.da.SearchCursor(line_layer, ["OID@", "SHAPE@"]) as rows:
+    # the cursor hands back shapes already projected to the working spatial reference
+    with _projected_rows(line_layer, ["OID@", "SHAPE@"], spatial_reference) as rows:
         # iter over each row in cursor, get the oid and geometry
         for line_oid, geometry in rows:
             if geometry is None or geometry.pointCount == 0:
                 continue
-
-            # project the geometry if needed
-            geometry = _project_if_needed(geometry, spatial_reference, transformation)
 
             if getattr(geometry, 'hasCurves', False):
                 # densify the geometry if it has curves
@@ -163,17 +133,15 @@ def _calculate_matches(point_layer, spatial_reference, index: EndpointIndex) -> 
     '''calculate the matches for a point layer'''
 
     matches: Dict[int, Match] = {}
-    transformation = _projection_for_layer(point_layer, spatial_reference)
 
-    # iter over each row in cursor, get the oid and geometry
-    with arcpy.da.SearchCursor(point_layer, ["OID@", "SHAPE@"]) as rows:
+    # iter over each row in cursor, get the oid and projected geometry
+    with _projected_rows(point_layer, ["OID@", "SHAPE@"], spatial_reference) as rows:
         for point_oid, geometry in rows:
             if geometry is None or geometry.pointCount == 0:
                 # if the geometry is empty, add a match for the empty geometry
                 matches[point_oid] = Match("EMPTY_GEOMETRY")
                 continue
 
-            geometry = _project_if_needed(geometry, spatial_reference, transformation)
             point = geometry.firstPoint # get the first point of the geometry
 
             # add the match to the matches dictionary
@@ -196,7 +164,7 @@ def _ensure_rotation_field(point_layer, requested_name: str) -> str:
     existing = fields.get(valid_name.lower()) # get the existing field
 
     if existing: # if the field exists
-        if existing.type not in {'Double', 'Single', 'Integer', 'SmallInteger'}: 
+        if existing.type not in common.NUMERIC_FIELD_TYPES:
             # if the field is not numeric, raise an error
             raise ValueError('Existing rotation field must be numeric')
         
@@ -225,9 +193,7 @@ def _validate_editable_layer(point_layer) -> None:
         raise ValueError('Arrowhead points must have an Object ID field')
 
     # check if the layer has any qualified fields
-    qualified_fields = [field.name for field in arcpy.ListFields(point_layer) if "." in field.name]
-
-    if qualified_fields:
+    if common.joined_field_names(point_layer):
         # if the layer has qualified fields, raise an error
         raise ValueError('Joined arrowhead layers are not supported; remove the join and run the tool again')
 
@@ -291,12 +257,7 @@ def execute(
     # convert the match distance into working spatial reference units
     tolerance = _tolerance_in_working_units(tolerance_text, spatial_reference)
     # convert the rotation buffer into degrees and make sure it is finite
-    try:
-        rotation_buffer = float(rotation_buffer_text)
-    except (TypeError, ValueError):
-        raise ValueError('Rotation buffer must be a number') from None
-    if not math.isfinite(rotation_buffer):
-        raise ValueError('Rotation buffer must be a finite number')
+    rotation_buffer = common.parse_rotation_buffer(rotation_buffer_text)
     # get the one meter value for the spatial reference
     one_meter = 1.0 / spatial_reference.metersPerUnit
     # get the tangent distance for curved line endpoints

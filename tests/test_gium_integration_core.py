@@ -20,8 +20,10 @@ from gium_integration_core import (  # noqa: E402
     PACKAGE_ZIP,
     QA_COLUMNS,
     QARow,
+    SPELLCHECK_ROLES,
     coalesce_value,
     dataset_base_name,
+    distinct_text_values,
     ensure_no_artifact_collisions,
     field_definition,
     find_artifact_collisions,
@@ -30,13 +32,19 @@ from gium_integration_core import (  # noqa: E402
     parse_dataset_row,
     parse_dataset_rows,
     qa_csv_text,
+    qa_failure_report_name,
+    qa_failure_report_path,
+    qa_overall_result,
     qa_report_name,
+    qa_warning_count,
     release_artifact_names,
     release_artifact_paths,
     resolve_package_formats,
     resolve_role_fields,
+    resolve_source_role_fields,
     resolved_role_value,
     select_shapefile_zip_members,
+    spellcheck_warning,
     strip_release_stamp,
     validate_required_value,
     validate_required_values,
@@ -59,6 +67,27 @@ def points():
 
 
 class RoleResolutionTests(unittest.TestCase):
+    def test_arrow_season_falls_back_to_type_on_new_data(self):
+        resolved, stand_ins = resolve_source_role_fields(
+            [text_field("Id"), text_field("Type")], arrows()
+        )
+        self.assertEqual(resolved["season"].name, "Type")
+        self.assertEqual(stand_ins, {"season": "Type"})
+
+    def test_arrow_season_field_wins_over_type(self):
+        resolved, stand_ins = resolve_source_role_fields(
+            [text_field("Season"), text_field("Type")], arrows()
+        )
+        self.assertEqual(resolved["season"].name, "Season")
+        self.assertEqual(stand_ins, {})
+
+    def test_type_is_not_a_season_stand_in_for_point_labels(self):
+        # point labels use Type for their own role, so it never stands in for season
+        resolved, stand_ins = resolve_source_role_fields([text_field("Type")], points())
+        self.assertIsNone(resolved["season"])
+        self.assertEqual(resolved["type"].name, "Type")
+        self.assertEqual(stand_ins, {})
+
     def test_line_roles_resolve_case_insensitively(self):
         resolved = resolve_role_fields(
             [
@@ -243,8 +272,10 @@ class LayerProfileTests(unittest.TestCase):
 
     def test_blank_package_keeps_the_profile_default(self):
         self.assertEqual(resolve_package_formats("", arrows()), ("zip",))
+        # point labels are zipped and replace the Mapbox file like every other layer
+        self.assertEqual(resolve_package_formats(None, points()), ("zip",))
         self.assertEqual(
-            resolve_package_formats(None, points()), ("geojson",)
+            resolve_package_formats(PACKAGE_GEOJSON, points()), ("geojson",)
         )
         self.assertEqual(resolve_package_formats(PACKAGE_BOTH, arrows()), ("zip", "geojson"))
         self.assertEqual(PACKAGE_CHOICES, (PACKAGE_ZIP, PACKAGE_GEOJSON, PACKAGE_BOTH))
@@ -287,7 +318,7 @@ class ReleaseArtifactTests(unittest.TestCase):
             point_names.all(),
             (
                 "GIUMPointLabelsMerged_April9_2026.shp",
-                "GIUMPointLabelsMerged_April9_2026.geojson",
+                "GIUMPointLabelsMerged_April9_2026.zip",
             ),
         )
         self.assertEqual(
@@ -295,7 +326,7 @@ class ReleaseArtifactTests(unittest.TestCase):
             "SeasonalArrowsMerged_April9_2026.shp",
         )
         self.assertEqual(
-            release_artifact_names(points(), "20260409").geojson,
+            release_artifact_names(points(), "20260409", PACKAGE_GEOJSON).geojson,
             "GIUMPointLabelsMerged_April9_2026.geojson",
         )
         self.assertEqual(
@@ -329,7 +360,9 @@ class ReleaseArtifactTests(unittest.TestCase):
 
     def test_paths_join_to_selected_folder(self):
         line_paths = release_artifact_paths("/release folder", arrows(), "20260409")
-        point_paths = release_artifact_paths("/release folder", points(), "20260409")
+        point_paths = release_artifact_paths(
+            "/release folder", points(), "20260409", PACKAGE_GEOJSON
+        )
         self.assertEqual(
             line_paths["zip"],
             os.path.join("/release folder", "SeasonalArrowsMerged_April9_2026.zip"),
@@ -373,6 +406,61 @@ class QAReportTests(unittest.TestCase):
     def test_csv_rejects_unstructured_rows(self):
         with self.assertRaisesRegex(TypeError, "QARow"):
             qa_csv_text([{"section": "counts"}])
+
+    def test_overall_result_counts_warnings(self):
+        passing = [QARow("Release", "release_date", "PASS", "June10_2026")]
+        self.assertEqual(qa_warning_count(passing), 0)
+        self.assertEqual(qa_overall_result(passing), "PASS")
+        one = passing + [QARow("Row 1", "class_spellcheck", "WARN", "Rnage")]
+        self.assertEqual(qa_overall_result(one), "PASS with 1 warning")
+        two = one + [QARow("Row 1", "unmapped_new_fields", "WARN", "Notes")]
+        self.assertEqual(qa_warning_count(two), 2)
+        self.assertEqual(qa_overall_result(two), "PASS with 2 warnings")
+
+    def test_failure_report_name_never_matches_the_release_report(self):
+        self.assertEqual(
+            qa_failure_report_name("20260610"),
+            "GIUMIntegration_June10_2026_QA_FAILED.csv",
+        )
+        self.assertNotEqual(
+            qa_failure_report_name("20260610"), qa_report_name("20260610")
+        )
+        self.assertEqual(
+            qa_failure_report_path("release", datetime.date(2026, 6, 10)),
+            os.path.join("release", "GIUMIntegration_June10_2026_QA_FAILED.csv"),
+        )
+        with self.assertRaisesRegex(ValueError, "Output folder"):
+            qa_failure_report_path("", "20260610")
+
+
+class SpellcheckTests(unittest.TestCase):
+    def test_distinct_values_are_stripped_and_keep_first_seen_order(self):
+        self.assertEqual(
+            distinct_text_values([" Range", None, "", "Fence", "Range", 3, "fence"]),
+            ["Range", "Fence", "3", "fence"],
+        )
+
+    def test_only_class_and_type_are_spellchecked(self):
+        self.assertEqual(SPELLCHECK_ROLES, ("class", "type"))
+
+    def test_existing_blank_or_unchecked_values_do_not_warn(self):
+        self.assertIsNone(spellcheck_warning("Row 1", "class", "Fence", ["Fence"]))
+        self.assertIsNone(spellcheck_warning("Row 1", "class", " ", ["Fence"]))
+        self.assertIsNone(spellcheck_warning("Row 1", "class", "Fence", []))
+
+    def test_new_value_lists_the_existing_choices(self):
+        warning = spellcheck_warning("Row 2", "class", "fence", ["Fence", "Railway"])
+        self.assertEqual(
+            warning,
+            "Row 2 class 'fence' is not an existing value. Existing values are: "
+            "Fence, Railway. If this is a genuinely new class, you can ignore this.",
+        )
+
+    def test_long_choice_lists_are_shortened(self):
+        existing = [f"Value {index}" for index in range(15)]
+        warning = spellcheck_warning("Row 1", "type", "Other", existing, limit=12)
+        self.assertIn("Value 11, and 3 more.", warning)
+        self.assertNotIn("Value 12", warning)
 
 
 class ShapefilePackageTests(unittest.TestCase):

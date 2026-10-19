@@ -13,9 +13,9 @@ import io
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dataclass_field
 from numbers import Integral, Real
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
 TEXT_FIELD_TYPES = frozenset({'String'})
@@ -86,6 +86,9 @@ class LayerProfile:
 
     shape_type of None accepts any supported geometry, and output_base of None
     means the release is named after the chosen production target.
+    source_fallbacks names stand-in fields the new data can use for a role when
+    it has none of the usual names, such as arrow lines that keep their season
+    in Type.
     '''
 
     name: str
@@ -94,6 +97,7 @@ class LayerProfile:
     required_roles: Tuple[str, ...]
     output_base: Optional[str]
     default_package: str
+    source_fallbacks: Mapping[str, Tuple[str, ...]] = dataclass_field(default_factory=dict)
 
 
 def _role_aliases(*roles: str) -> Dict[str, Tuple[str, ...]]:
@@ -112,6 +116,8 @@ LAYER_PROFILES: Tuple[LayerProfile, ...] = (
         required_roles=('herd', 'country', 'season', 'class'),
         output_base='SeasonalArrowsMerged',
         default_package=PACKAGE_ZIP,
+        # production arrows keep the season in Type too, so new lines often only have Type
+        source_fallbacks={'season': ('Type',)},
     ),
     LayerProfile(
         name='GIUM point labels',
@@ -119,7 +125,7 @@ LAYER_PROFILES: Tuple[LayerProfile, ...] = (
         aliases=_role_aliases('herd', 'country', 'season', 'type', 'rotation'),
         required_roles=('herd', 'season', 'type', 'rotation'),
         output_base='GIUMPointLabelsMerged',
-        default_package=PACKAGE_GEOJSON,
+        default_package=PACKAGE_ZIP,
     ),
     LayerProfile(
         name='Linear barriers',
@@ -290,6 +296,9 @@ class DatasetArtifactNames:
 
 
 QA_COLUMNS = ('section', 'check', 'status', 'value', 'details')
+QA_PASS = 'PASS'
+QA_WARN = 'WARN'
+QA_FAIL = 'FAIL'
 
 
 @dataclass(frozen=True)
@@ -369,6 +378,37 @@ def resolve_role_fields(
         resolved[role] = match
 
     return resolved
+
+
+def resolve_source_role_fields(
+    fields: Iterable[object],
+    profile: LayerProfile,
+) -> Tuple[Dict[str, Optional[FieldDefinition]], Dict[str, str]]:
+    '''match GIUM roles on the new data, using a stand-in field when the usual one is missing
+
+    returns the resolved roles and {role: stand-in field name} for every role
+    that was filled from a stand-in. a stand-in is only used when exactly one
+    field matches and no other role already uses it.
+    '''
+
+    definitions = tuple(field_definition(field) for field in fields)
+    resolved = resolve_role_fields(definitions, profile, require_profile_roles=False)
+    used = {field.name.casefold() for field in resolved.values() if field}
+    stand_ins: Dict[str, str] = {}
+    for role, names in profile.source_fallbacks.items():
+        if role not in resolved or resolved[role] is not None:
+            continue
+        accepted = {name.casefold() for name in names}
+        matches = [
+            field for field in definitions
+            if field.name.casefold() in accepted and field.name.casefold() not in used
+        ]
+        if len(matches) != 1:
+            continue
+        resolved[role] = matches[0]
+        used.add(matches[0].name.casefold())
+        stand_ins[role] = matches[0].name
+    return resolved, stand_ins
 
 
 def is_blank(value: object) -> bool:
@@ -506,6 +546,64 @@ def resolved_role_value(
     return value
 
 
+# typed class and type values are compared with what production already uses,
+# since a typo there quietly becomes a new category on the map. season is left
+# out because new seasons are common and expected.
+SPELLCHECK_ROLES = ('class', 'type')
+SPELLCHECK_LIST_LIMIT = 12
+
+
+def distinct_text_values(values: Iterable[object]) -> List[str]:
+    '''list the distinct non-blank values as text in first-seen order'''
+
+    distinct: List[str] = []
+    seen = set()
+    for value in values:
+        text = '' if value is None else str(value).strip()
+        if text and text not in seen:
+            seen.add(text)
+            distinct.append(text)
+    return distinct
+
+
+def shared_value(values: Sequence[str]) -> Optional[str]:
+    '''return the one value every production feature uses, or None when they differ
+
+    a blank class or type can safely be filled with it, since a fill value only
+    ever replaces blanks on the new features.
+    '''
+
+    return values[0] if len(values) == 1 else None
+
+
+def spellcheck_warning(
+    label: str,
+    role: str,
+    typed: object,
+    existing: Iterable[str],
+    limit: int = SPELLCHECK_LIST_LIMIT,
+) -> Optional[str]:
+    '''explain a typed value that production has never used, or return None
+
+    the match is exact on purpose, so a capitalization slip is flagged too.
+    '''
+
+    typed_text = '' if typed is None else str(typed).strip()
+    existing = list(existing)
+    if not typed_text or not existing or typed_text in existing:
+        return None
+    listed = existing[:limit]
+    extra = len(existing) - len(listed)
+    choices = ', '.join(listed)
+    if extra > 0:
+        choices = f'{choices}, and {extra} more'
+    return (
+        f'{label} {role} {typed_text!r} is not an existing value. '
+        f'Existing values are: {choices}. If this is a genuinely new {role}, '
+        'you can ignore this.'
+    )
+
+
 _MONTH_NAMES = (
     '',
     'January',
@@ -560,7 +658,8 @@ def strip_release_stamp(name: object) -> str:
     would otherwise stack one stamp on top of another.
     '''
 
-    base = os.path.basename(str(name or '').strip())
+    # normalize separators so a Windows path splits correctly on any platform
+    base = os.path.basename(str(name or '').strip().replace('\\', '/'))
     base = os.path.splitext(base)[0]
     return _RELEASE_STAMP_PATTERN.sub('', base)
 
@@ -629,6 +728,23 @@ def qa_report_path(output_folder: object, release_date: object) -> str:
     return os.path.join(_required_folder(output_folder), qa_report_name(release_date))
 
 
+def qa_failure_report_name(release_date: object) -> str:
+    '''name the report left behind when a release fails
+
+    it never matches a release filename, so it cannot block the next attempt.
+    '''
+
+    return f'GIUMIntegration_{release_stamp(release_date)}_QA_FAILED.csv'
+
+
+def qa_failure_report_path(output_folder: object, release_date: object) -> str:
+    '''join the failure report name to a folder without creating anything'''
+
+    return os.path.join(
+        _required_folder(output_folder), qa_failure_report_name(release_date)
+    )
+
+
 def _required_folder(output_folder: object) -> str:
     '''reject a blank output folder before any path is built from it'''
 
@@ -656,6 +772,21 @@ def ensure_no_artifact_collisions(
     collisions = find_artifact_collisions(paths, exists)
     if collisions:
         raise ValueError('Release output already exists: ' + ', '.join(collisions))
+
+
+def qa_warning_count(rows: Iterable[QARow]) -> int:
+    '''count the WARN rows in a QA report'''
+
+    return sum(1 for row in rows if row.status == QA_WARN)
+
+
+def qa_overall_result(rows: Iterable[QARow]) -> str:
+    '''summarize a passing release as PASS or PASS with N warnings'''
+
+    warnings = qa_warning_count(rows)
+    if not warnings:
+        return QA_PASS
+    return f'{QA_PASS} with {warnings} warning{"" if warnings == 1 else "s"}'
 
 
 def qa_csv_text(rows: Iterable[QARow]) -> str:

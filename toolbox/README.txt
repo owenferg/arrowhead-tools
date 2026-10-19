@@ -1,13 +1,15 @@
 <-- ARROWHEAD TOOLS -->
 
-Keep all six Python files together when using the toolbox:
+Keep all of these files together when using the toolbox:
 
 - arrow_tools.pyt
+- arcpy_common.py
 - arrow_creation_arcpy.py
 - arrow_rotation_arcpy.py
 - arrow_rotation_core.py
 - gium_integration_arcpy.py
 - gium_integration_core.py
+- arrowhead_symbology.lyrx
 
 How to use:
 
@@ -41,9 +43,12 @@ the name is your arrow line layer followed by _Arrowheads.
 
 The new layer keeps the editable fields from the lines and adds fields for the source
 line, multipart part, endpoint type, and arrowhead rotation. For multipart lines,
-CUSTOM applies the line's placement value to every open part. The script creates
-rotation-ready data, but does not choose your arrowhead symbol. Set up your preferred
-marker in the layer's symbology and use the rotation field to rotate it.
+CUSTOM applies the line's placement value to every open part. When the new layer is
+added to the map, it's already drawn with a gray arrowhead that is rotated by the
+rotation field, so there's no need to set up the symbology yourself. If you'd like
+to use a different arrowhead symbol, replace arrowhead_symbology.lyrx with your own
+layer file. Just make sure its rotation is set by the Rotation field and that the
+symbol points east (right) before it's rotated.
 
 For updating rotations when you already have arrowhead points:
 
@@ -79,7 +84,7 @@ passes every check.
 - Layer type: choose Seasonal arrows, GIUM point labels, Linear barriers,
   Point barriers, Polygon features, Protected areas, Line labels, or Other.
   This controls which fields are required, the output filename, and the
-  default package (ZIP for most layers, GeoJSON for point labels).
+  default package (a ZIP).
 - Existing production shapefile: choose the complete latest .shp file for
   that layer, not a geodatabase feature class. The tool ignores selections
   on this historical target so old features are not accidentally omitted.
@@ -87,14 +92,20 @@ passes every check.
   queries are honored. The geometry type must match the layer type
   (polygons for protected areas, lines for seasonal arrows, and so on).
 - Class, Type, and Season: optional; fill blanks on the new features only.
-  Values already present are preserved. For Class and Type, type these to
-  match existing spelling and capitalization when you can; the tool warns
-  if the value is not already in the target, which usually means a typo.
-  Ignore the warning when you are intentionally adding a new category.
-  Season is not spell-checked because new season names are added often.
-- Package as: optional. Leave blank to use the default for that layer type
-  (ZIP for most layers, GeoJSON for point labels). Choose Both when you
-  need a shapefile ZIP and a GeoJSON from the same row.
+  Values already present are preserved. If every feature in the production
+  shapefile has the same Class or Type (like "Seasonal Movement" for seasonal
+  arrows), that value is filled in for you as soon as you pick the shapefile,
+  and you can still change it. Otherwise, type these to match existing
+  spelling and capitalization when you can; the tool warns if the value is
+  not already in the target, which usually means a typo. Ignore the warning
+  when you are intentionally adding a new category. Season is not
+  spell-checked because new season names are added often. For seasonal
+  arrows, if the new lines don't have a Season field, the season is taken
+  from their Type field instead, so you only need to type a Season when
+  neither field is filled in.
+- Package as: optional. Leave blank for the default ZIP, which is what
+  Mapbox uses for every layer, including point labels. Choose GeoJSON or
+  Both only when you specifically need a GeoJSON.
 - Geographic transformation: optional; only needed when the new data and
   the existing target use different datums. Type a transformation name if
   you need a specific one; otherwise leave it blank and the tool picks
@@ -108,19 +119,35 @@ passes every check.
   and GIUMIntegration_June10_2026_QA.csv.
 - Release output folder: choose a writable folder for the new shapefiles,
   ZIP or GeoJSON packages, and QA CSV. Existing releases are never overwritten.
-
-The tool stops before copying if the new data contains multipart features.
-Mapbox cannot import multipart data, so run Multipart To Singlepart first
-and choose that result.
+- Split multipart features into single parts: optional, off by default.
+  Mapbox cannot import multipart data, so the tool normally stops if the new
+  data has any. Check this box to have the tool split them on its own copy of
+  the new data instead. Your original data is not changed.
+- Project without a datum transformation when ArcGIS has none: optional, off
+  by default. Only check this if the tool stops because ArcGIS has no
+  transformation between the two datums. Features can shift slightly (anywhere
+  from a few meters up to a few hundred depending on the datums), so check
+  their placement closely afterward.
 
 The tool validates geometry, projections, GIUM fields, metadata, rotation,
 and row counts before it publishes the dated outputs. It never changes the
-selected target or source datasets. Review the old and new layers visually
-in ArcGIS Pro before uploading anything to Mapbox.
+selected target or source datasets. When it finishes, the new release
+shapefiles are added to the map you have open, so you can compare the old
+and new layers right away. Review them visually in ArcGIS Pro before
+uploading anything to Mapbox.
 
-To see changes made by the first two tools reflected in ArcGIS Pro,
+The QA CSV lists every check the tool ran. Anything marked WARN didn't stop
+the release but is worth a look, such as a Class or Type that isn't already in
+the target, fields on the new data that weren't carried over, or geometry
+problems that were already in the production layer. If a run fails, the tool
+leaves a GIUMIntegration_<date>_QA_FAILED.csv in the output folder that shows
+how far it got and why it stopped. It gets deleted the next time that release
+is created successfully.
+
+To see changes made by the rotation tool reflected in ArcGIS Pro,
 go to the layer's Symbology and go to the "Vary symbol by attribute" tab.
-Pick the rotation field and set the rotation to Geographic.
+Pick the rotation field and set the rotation to Geographic. (Layers created by
+the first tool already have this set up.)
 
 Any questions? Reach out to Owen Ferguson:
 owen@owenferg.com
@@ -129,4 +156,4 @@ owenf@uoregon.edu
 Visit the Github repository for more information:
 https://github.com/owenferg/arrowhead-tools
 
-Arrowhead Tools v1.5
+Arrowhead Tools v1.6

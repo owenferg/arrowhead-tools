@@ -1,0 +1,142 @@
+{
+  "type" : "CIMLayerDocument",
+  "version" : "3.0.0",
+  "build" : 36056,
+  "layers" : [
+    "CIMPATH=map/arrowheads.json"
+  ],
+  "layerDefinitions" : [
+    {
+      "type" : "CIMFeatureLayer",
+      "name" : "Arrowheads",
+      "uRI" : "CIMPATH=map/arrowheads.json",
+      "sourceModifiedTime" : {
+        "type" : "TimeInstant"
+      },
+      "useSourceMetadata" : true,
+      "description" : "Arrowheads",
+      "layerType" : "Operational",
+      "showLegends" : true,
+      "visibility" : true,
+      "displayCacheType" : "Permanent",
+      "maxDisplayCacheAge" : 5,
+      "showPopups" : true,
+      "serviceLayerID" : -1,
+      "refreshRate" : -1,
+      "refreshRateUnit" : "esriTimeUnitsSeconds",
+      "blendingMode" : "Alpha",
+      "autoGenerateFeatureTemplates" : true,
+      "featureElevationExpression" : "0",
+      "featureTable" : {
+        "type" : "CIMFeatureTable",
+        "displayField" : "Rotation",
+        "editable" : true,
+        "dataConnection" : {
+          "type" : "CIMStandardDataConnection",
+          "workspaceConnectionString" : "DATABASE=.\\arrowheads.gdb",
+          "workspaceFactory" : "FileGDB",
+          "dataset" : "Arrowheads",
+          "datasetType" : "esriDTFeatureClass"
+        },
+        "studyAreaSpatialRel" : "esriSpatialRelUndefined",
+        "searchOrder" : "esriSearchOrderSpatial"
+      },
+      "htmlPopupEnabled" : true,
+      "selectable" : true,
+      "featureCacheType" : "Session",
+      "displayFiltersType" : "ByScale",
+      "featureBlendingMode" : "Alpha",
+      "renderer" : {
+        "type" : "CIMSimpleRenderer",
+        "patch" : "Default",
+        "symbol" : {
+          "type" : "CIMSymbolReference",
+          "symbol" : {
+            "type" : "CIMPointSymbol",
+            "symbolLayers" : [
+              {
+                "type" : "CIMVectorMarker",
+                "enable" : true,
+                "anchorPointUnits" : "Relative",
+                "dominantSizeAxis3D" : "Y",
+                "size" : 8,
+                "billboardMode3D" : "FaceNearPlane",
+                "frame" : {
+                  "xmin" : -4,
+                  "ymin" : -4,
+                  "xmax" : 4,
+                  "ymax" : 4
+                },
+                "markerGraphics" : [
+                  {
+                    "type" : "CIMMarkerGraphic",
+                    "geometry" : {
+                      "rings" : [
+                        [
+                          [4, 0],
+                          [-4, -4],
+                          [-2, 0],
+                          [-4, 4],
+                          [4, 0]
+                        ]
+                      ]
+                    },
+                    "symbol" : {
+                      "type" : "CIMPolygonSymbol",
+                      "symbolLayers" : [
+                        {
+                          "type" : "CIMSolidFill",
+                          "enable" : true,
+                          "color" : {
+                            "type" : "CIMRGBColor",
+                            "values" : [38, 38, 38, 100]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ],
+                "scaleSymbolsProportionally" : true,
+                "respectFrame" : true
+              }
+            ],
+            "haloSize" : 1,
+            "scaleX" : 1,
+            "angleAlignment" : "Map"
+          }
+        },
+        "label" : "Arrowhead",
+        "visualVariables" : [
+          {
+            "type" : "CIMRotationVisualVariable",
+            "visualVariableInfoX" : {
+              "type" : "CIMVisualVariableInfo",
+              "randomMax" : 360,
+              "visualVariableInfoType" : "None"
+            },
+            "visualVariableInfoY" : {
+              "type" : "CIMVisualVariableInfo",
+              "randomMax" : 360,
+              "visualVariableInfoType" : "None"
+            },
+            "visualVariableInfoZ" : {
+              "type" : "CIMVisualVariableInfo",
+              "randomMax" : 360,
+              "expression" : "$feature.Rotation",
+              "valueExpressionInfo" : {
+                "type" : "CIMExpressionInfo",
+                "title" : "Custom",
+                "expression" : "$feature.Rotation",
+                "returnType" : "Default"
+              },
+              "visualVariableInfoType" : "Expression"
+            },
+            "rotationTypeZ" : "Geographic"
+          }
+        ]
+      },
+      "scaleSymbols" : true,
+      "snappable" : true
+    }
+  ]
+}
